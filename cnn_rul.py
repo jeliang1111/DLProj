@@ -47,17 +47,24 @@ def split_into_battery_segments(dataframe: pd.DataFrame) -> list[pd.DataFrame]:
 
 def build_sliding_windows(
     segments: list[pd.DataFrame], window_size: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create (window, rul_label) pairs from each battery segment."""
-    windows = []
-    labels  = []
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create (window, is_nasa_flag, rul_label) triples from each battery segment."""
+    windows    = []
+    nasa_flags = []
+    labels     = []
     for seg in segments:
         feature_array = seg[FEATURE_COLS].values.astype(np.float32)
         rul_array     = seg["RUL"].values.astype(np.float32)
+        is_nasa_flag  = float(seg["Is_NASA"].iloc[0])
         for i in range(len(seg) - window_size):
             windows.append(feature_array[i : i + window_size])
+            nasa_flags.append(is_nasa_flag)
             labels.append(rul_array[i + window_size - 1])
-    return np.array(windows), np.array(labels, dtype=np.float32)
+    return (
+        np.array(windows),
+        np.array(nasa_flags, dtype=np.float32),
+        np.array(labels, dtype=np.float32),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,16 +72,17 @@ def build_sliding_windows(
 # ---------------------------------------------------------------------------
 
 class BatteryWindowDataset(Dataset):
-    def __init__(self, windows: np.ndarray, labels: np.ndarray):
+    def __init__(self, windows: np.ndarray, nasa_flags: np.ndarray, labels: np.ndarray):
         # Conv1d expects (batch, channels, length), so permute from (N, T, C) -> (N, C, T)
-        self.X = torch.tensor(windows).permute(0, 2, 1)
-        self.y = torch.tensor(labels).unsqueeze(1)
+        self.X_seq    = torch.tensor(windows).permute(0, 2, 1)
+        self.X_static = torch.tensor(nasa_flags).unsqueeze(1)   # (N, 1)
+        self.y        = torch.tensor(labels).unsqueeze(1)
 
     def __len__(self) -> int:
         return len(self.y)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.X[idx], self.y[idx]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.X_seq[idx], self.X_static[idx], self.y[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -93,14 +101,20 @@ class ConvBlock(nn.Module):
 
 
 class RULConvNet(nn.Module):
-    """1D CNN for battery RUL regression.
+    """Dual-branch 1D CNN for battery RUL regression.
 
-    Input:  (batch, num_features, window_size)
-    Output: (batch, 1)
+    Branch A (sequential): Conv1D layers over the 7 cycle features.
+    Branch B (static):     Small Dense layer for the Is_NASA flag.
+    Both branches are concatenated before the final regression head.
+
+    Inputs:  seq    (batch, num_features, window_size)
+             static (batch, 1)
+    Output:  (batch, 1)
     """
 
     def __init__(self, num_features: int):
         super().__init__()
+        # Branch A: temporal encoder
         self.encoder = nn.Sequential(
             ConvBlock(num_features, 64,  kernel_size=3),
             ConvBlock(64,           128, kernel_size=3),
@@ -108,19 +122,28 @@ class RULConvNet(nn.Module):
             ConvBlock(128,          128, kernel_size=3),
             ConvBlock(128,          64,  kernel_size=3),
         )
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)   # → (batch, 64, 1)
+
+        # Branch B: static source encoder
+        self.static_encoder = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.ReLU(),
+        )
+
+        # Regression head: 64 (CNN) + 8 (static) = 72
         self.regressor = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64, 64),
+            nn.Linear(64 + 8, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.encoder(x)
-        pooled   = self.global_avg_pool(features)
-        return self.regressor(pooled)
+    def forward(self, seq: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        temporal_features = self.global_avg_pool(self.encoder(seq))  # (batch, 64, 1)
+        temporal_features = temporal_features.squeeze(-1)             # (batch, 64)
+        static_features   = self.static_encoder(static)               # (batch, 8)
+        combined          = torch.cat([temporal_features, static_features], dim=1)  # (batch, 72)
+        return self.regressor(combined)
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +159,12 @@ def train_one_epoch(
 ) -> float:
     model.train()
     total_loss = 0.0
-    for batch_x, batch_y in loader:
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+    for batch_seq, batch_static, batch_y in loader:
+        batch_seq, batch_static, batch_y = (
+            batch_seq.to(device), batch_static.to(device), batch_y.to(device)
+        )
         optimizer.zero_grad()
-        loss = criterion(model(batch_x), batch_y)
+        loss = criterion(model(batch_seq, batch_static), batch_y)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * len(batch_y)
@@ -157,9 +182,11 @@ def evaluate(
     all_preds  = []
     all_labels = []
     with torch.no_grad():
-        for batch_x, batch_y in loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            preds = model(batch_x)
+        for batch_seq, batch_static, batch_y in loader:
+            batch_seq, batch_static, batch_y = (
+                batch_seq.to(device), batch_static.to(device), batch_y.to(device)
+            )
+            preds = model(batch_seq, batch_static)
             total_loss += criterion(preds, batch_y).item() * len(batch_y)
             all_preds.append(preds.cpu().numpy())
             all_labels.append(batch_y.cpu().numpy())
@@ -179,21 +206,33 @@ def main():
     df = pd.read_csv(DATA_PATH)
     print(f"Loaded dataset: {df.shape}")
 
-    battery_segments   = split_into_battery_segments(df)
-    train_segments     = battery_segments[:-NUM_TEST_BATTERIES]
-    test_segments      = battery_segments[-NUM_TEST_BATTERIES:]
+    battery_segments = split_into_battery_segments(df)
+
+    # Stratified split: sample test batteries from each source (CALCE + NASA)
+    # to avoid testing entirely on an unseen data distribution.
+    rng = np.random.default_rng(42)
+    calce_indices = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 0]
+    nasa_indices  = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 1]
+
+    num_test_calce = NUM_TEST_BATTERIES // 2
+    num_test_nasa  = NUM_TEST_BATTERIES - num_test_calce
+    test_indices = list(rng.choice(calce_indices, size=num_test_calce, replace=False)) + \
+                   list(rng.choice(nasa_indices,  size=num_test_nasa,  replace=False))
+    test_index_set = set(test_indices)
+    train_segments = [s for i, s in enumerate(battery_segments) if i not in test_index_set]
+    test_segments  = [battery_segments[i] for i in test_indices]
     print(f"Batteries — train: {len(train_segments)}, test: {len(test_segments)}")
 
-    X_train, y_train = build_sliding_windows(train_segments, WINDOW_SIZE)
-    X_test,  y_test  = build_sliding_windows(test_segments,  WINDOW_SIZE)
+    X_train, nasa_train, y_train = build_sliding_windows(train_segments, WINDOW_SIZE)
+    X_test,  nasa_test,  y_test  = build_sliding_windows(test_segments,  WINDOW_SIZE)
     print(f"Train windows: {X_train.shape}, Test windows: {X_test.shape}")
 
     train_loader = DataLoader(
-        BatteryWindowDataset(X_train, y_train),
+        BatteryWindowDataset(X_train, nasa_train, y_train),
         batch_size=BATCH_SIZE, shuffle=True,  num_workers=0,
     )
     test_loader = DataLoader(
-        BatteryWindowDataset(X_test, y_test),
+        BatteryWindowDataset(X_test, nasa_test, y_test),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
     )
 
