@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//opt/anaconda3/**)",
+      "Read(//Users/caoqian/anaconda3/**)",
+      "Read(//Users/caoqian/miniconda3/**)",
+      "Read(//opt/**)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c \"import xgboost; print\\(xgboost.__version__\\)\")"
+    ]
+  }
+}
