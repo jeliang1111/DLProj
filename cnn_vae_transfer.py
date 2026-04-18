@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_PATH  = "combined_scaled_battery_data.csv"
+HNEI_DATA_PATH = "Battery_RUL.csv"
+NASA_DATA_PATH = "nasa_battery_cycles.csv"
 WINDOW_SIZE = 10
 BATCH_SIZE  = 256
 LATENT_DIM  = 32
@@ -379,10 +381,12 @@ def main():
     print(f"Using device: {device}\n")
 
     # --- segment data by battery ---
-    df = pd.read_csv(DATA_PATH)
-    all_segments  = split_into_battery_segments(df)
-    hnei_segments = [s for s in all_segments if s["Is_NASA"].iloc[0] == 0]
-    nasa_segments = [s for s in all_segments if s["Is_NASA"].iloc[0] == 1]
+    hnei_df = pd.read_csv(HNEI_DATA_PATH)
+    nasa_df = pd.read_csv(NASA_DATA_PATH)
+    hnei_df["Is_NASA"] = 0
+    nasa_df["Is_NASA"] = 1
+    hnei_segments = split_into_battery_segments(hnei_df)
+    nasa_segments = split_into_battery_segments(nasa_df)
     print(f"Total — HNEI: {len(hnei_segments)} batteries, NASA: {len(nasa_segments)} batteries")
 
     # --- reserve one battery from each domain for demo only ---
@@ -427,7 +431,27 @@ def main():
     source_val_segs     = source_shuffled[:n_source_val]
     print(f"{SOURCE_DOMAIN} source split — train: {len(source_train_segs)}, val: {len(source_val_segs)}")
 
-    # --- build raw window arrays ---
+    # --- feature scaling: fit StandardScaler on source training segments only ---
+    feat_scaler = StandardScaler()
+    source_train_features = pd.concat(source_train_segs)[FEATURE_COLS].values
+    feat_scaler.fit(source_train_features)
+
+    def scale_segments(segs: list[pd.DataFrame]) -> list[pd.DataFrame]:
+        scaled = []
+        for seg in segs:
+            s = seg.copy()
+            s[FEATURE_COLS] = feat_scaler.transform(s[FEATURE_COLS].values)
+            scaled.append(s)
+        return scaled
+
+    source_train_segs = scale_segments(source_train_segs)
+    source_val_segs   = scale_segments(source_val_segs)
+    target_finetune   = scale_segments(target_finetune)
+    target_test       = scale_segments(target_test)
+    demo_hnei         = scale_segments([demo_hnei])[0]
+    demo_nasa         = scale_segments([demo_nasa])[0]
+
+    # --- build window arrays ---
     X_source,      y_source      = build_sliding_windows(source_train_segs, WINDOW_SIZE)
     X_source_val,  y_source_val  = build_sliding_windows(source_val_segs,   WINDOW_SIZE)
     X_finetune,    y_finetune    = build_sliding_windows(target_finetune,    WINDOW_SIZE)

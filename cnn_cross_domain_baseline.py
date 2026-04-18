@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 # ---------------------------------------------------------------------------
 # Config  (mirrors cnn_vae_transfer.py so results are directly comparable)
 # ---------------------------------------------------------------------------
-DATA_PATH   = "combined_scaled_battery_data.csv"
+HNEI_DATA_PATH = "Battery_RUL.csv"
+NASA_DATA_PATH = "nasa_battery_cycles.csv"
 WINDOW_SIZE = 10
 BATCH_SIZE  = 256
 LR          = 1e-3
@@ -201,10 +203,12 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    df            = pd.read_csv(DATA_PATH)
-    all_segments  = split_into_battery_segments(df)
-    hnei_segments = [s for s in all_segments if s["Is_NASA"].iloc[0] == 0]
-    nasa_segments = [s for s in all_segments if s["Is_NASA"].iloc[0] == 1]
+    hnei_df = pd.read_csv(HNEI_DATA_PATH)
+    nasa_df = pd.read_csv(NASA_DATA_PATH)
+    hnei_df["Is_NASA"] = 0
+    nasa_df["Is_NASA"] = 1
+    hnei_segments = split_into_battery_segments(hnei_df)
+    nasa_segments = split_into_battery_segments(nasa_df)
     print(f"Total — HNEI: {len(hnei_segments)} batteries, NASA: {len(nasa_segments)} batteries")
 
     rng = np.random.default_rng(42)
@@ -230,6 +234,22 @@ def main():
     sorted_target   = sorted(target_segments, key=lambda s: len(s), reverse=True)
     target_test     = sorted_target[NUM_FINETUNE_BATTERIES:]
     print(f"{target_name} test batteries: {len(target_test)}\n")
+
+    # --- feature scaling: fit on source training segments only ---
+    feat_scaler = StandardScaler()
+    feat_scaler.fit(pd.concat(source_train_segs)[FEATURE_COLS].values)
+
+    def scale_segments(segs: list[pd.DataFrame]) -> list[pd.DataFrame]:
+        scaled = []
+        for seg in segs:
+            s = seg.copy()
+            s[FEATURE_COLS] = feat_scaler.transform(s[FEATURE_COLS].values)
+            scaled.append(s)
+        return scaled
+
+    source_train_segs = scale_segments(source_train_segs)
+    source_val_segs   = scale_segments(source_val_segs)
+    target_test       = scale_segments(target_test)
 
     # --- build windows ---
     X_train, y_train = build_sliding_windows(source_train_segs, WINDOW_SIZE)
