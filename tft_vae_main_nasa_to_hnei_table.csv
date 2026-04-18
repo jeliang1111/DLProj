@@ -1,0 +1,3 @@
+model,mae_cycles,rmse_cycles,r2_cycles,target_train_batteries
+Baseline TFT (no transfer),63.4387092590332,87.29756157999202,0.9271684885025024,3
+VAE + TFT Transfer (proposed),344.23455810546875,420.46934341281053,-0.6895989179611206,3
