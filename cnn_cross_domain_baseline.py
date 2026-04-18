@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 # ---------------------------------------------------------------------------
 # Config  (mirrors cnn_vae_transfer.py so results are directly comparable)
 # ---------------------------------------------------------------------------
-HNEI_DATA_PATH = "Battery_RUL.csv"
+HNEI_DATA_PATH = "Battery_RUL_Cleaned.csv"
 NASA_DATA_PATH = "nasa_battery_cycles.csv"
 WINDOW_SIZE = 10
 BATCH_SIZE  = 256

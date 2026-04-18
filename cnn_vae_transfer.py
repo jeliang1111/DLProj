@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-HNEI_DATA_PATH = "Battery_RUL.csv"
+HNEI_DATA_PATH = "Battery_RUL_Cleaned.csv"
 NASA_DATA_PATH = "nasa_battery_cycles.csv"
 WINDOW_SIZE = 10
 BATCH_SIZE  = 256
@@ -22,11 +22,11 @@ VAE_EPOCHS      = 50
 FINETUNE_EPOCHS = 100
 BASELINE_EPOCHS = 50
 
-NUM_FINETUNE_BATTERIES = 1
+NUM_FINETUNE_BATTERIES = 5
 
 # Set to "HNEI" to train on HNEI and transfer to NASA,
 # or "NASA" to train on NASA and transfer to HNEI.
-SOURCE_DOMAIN = "NASA"
+SOURCE_DOMAIN = "HNEI"
 
 CKPT_VAE       = f"checkpoint_vae_{SOURCE_DOMAIN}.pt"
 CKPT_TRANSFER  = f"checkpoint_transfer_{SOURCE_DOMAIN}.pt"
