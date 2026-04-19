@@ -1,0 +1,3 @@
+test_mae,test_rmse,num_test_predictions,window,best_val_loss,epochs_ran,train_samples,val_samples,test_samples,log_dir
+18.48518943786621,35.650068277130444,2899,10,10.872392654418945,18,13821,1794,2899,/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/sliding_window_compare/window_10/version_0
+25.055572509765625,39.25454044199855,3034,20,17.097745895385742,14,14195,1880,3034,/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/sliding_window_compare/window_20/version_0
