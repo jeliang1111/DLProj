@@ -10,7 +10,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 # Config
 # ---------------------------------------------------------------------------
 DATA_PATH         = "combined_scaled_battery_data.csv"
-WINDOW_SIZE       = 30
+CKPT_PATH         = "checkpoint_cnn_rul.pt"
+WINDOW_SIZE       = 10
 NUM_TEST_BATTERIES = 8
 BATCH_SIZE        = 256
 NUM_EPOCHS        = 50
@@ -208,9 +209,22 @@ def main():
 
     battery_segments = split_into_battery_segments(df)
 
+    rng = np.random.default_rng(42)
+
+    # --- reserve 1 CALCE + 1 NASA battery for demo, exclude from all training/testing ---
+    all_calce = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 0]
+    all_nasa  = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 1]
+    demo_calce = all_calce[rng.integers(len(all_calce))]
+    demo_nasa  = all_nasa[rng.integers(len(all_nasa))]
+    demo_df = pd.concat([demo_calce, demo_nasa], ignore_index=True)
+    demo_df.to_csv("demo_batteries_cnn.csv", index=False)
+    print(f"Demo batteries saved to demo_batteries_cnn.csv "
+          f"(CALCE: {len(demo_calce)} cycles, NASA: {len(demo_nasa)} cycles)")
+    battery_segments = [s for s in battery_segments
+                        if not s.equals(demo_calce) and not s.equals(demo_nasa)]
+
     # Stratified split: sample test batteries from each source (CALCE + NASA)
     # to avoid testing entirely on an unseen data distribution.
-    rng = np.random.default_rng(42)
     calce_indices = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 0]
     nasa_indices  = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 1]
 
@@ -245,16 +259,23 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {total_params:,}")
 
-    # --- training loop ---
+    # --- training loop (skip if checkpoint exists) ---
+    import os
     train_losses, val_losses = [], []
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, _, _ = evaluate(model, test_loader, criterion, device)
-        scheduler.step()
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train_loss={train_loss:.2f}  val_loss={val_loss:.2f}")
+    if os.path.exists(CKPT_PATH):
+        model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
+        print(f"Loaded checkpoint from {CKPT_PATH}, skipping training.")
+    else:
+        for epoch in range(1, NUM_EPOCHS + 1):
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, _, _ = evaluate(model, test_loader, criterion, device)
+            scheduler.step()
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train_loss={train_loss:.2f}  val_loss={val_loss:.2f}")
+        torch.save(model.state_dict(), CKPT_PATH)
+        print(f"Checkpoint saved to {CKPT_PATH}")
 
     # --- final evaluation ---
     _, cnn_preds, cnn_labels = evaluate(model, test_loader, criterion, device)

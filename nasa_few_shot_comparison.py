@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 
 # ---------------------------------------------------------------------------
 # Config
@@ -64,11 +64,21 @@ def build_sliding_windows(
     return np.array(windows), np.array(labels, dtype=np.float32)
 
 
-def scale_segments(segs: list[pd.DataFrame], scaler: StandardScaler) -> list[pd.DataFrame]:
+def fit_scaler(train_segs: list[pd.DataFrame]) -> tuple[MinMaxScaler, np.ndarray, np.ndarray]:
+    vals  = pd.concat(train_segs)[FEATURE_COLS].values
+    lower = np.percentile(vals, 1, axis=0)
+    upper = np.percentile(vals, 99, axis=0)
+    scaler = MinMaxScaler()
+    scaler.fit(np.clip(vals, lower, upper))
+    return scaler, lower, upper
+
+
+def scale_segments(segs: list[pd.DataFrame], scaler: MinMaxScaler,
+                   lower: np.ndarray, upper: np.ndarray) -> list[pd.DataFrame]:
     result = []
     for seg in segs:
         s = seg.copy()
-        s[FEATURE_COLS] = scaler.transform(s[FEATURE_COLS].values)
+        s[FEATURE_COLS] = scaler.transform(np.clip(s[FEATURE_COLS].values, lower, upper))
         result.append(s)
     return result
 
@@ -308,15 +318,12 @@ def main():
     # Each domain uses its own feature scaler so neither domain's data is distorted
     # by the other's statistics. HNEI scaler fit on all HNEI; NASA scaler fit on the
     # 1 training battery (the only NASA data we are allowed to use at training time).
-    hnei_feat_scaler = StandardScaler()
-    hnei_feat_scaler.fit(pd.concat(hnei_segments)[FEATURE_COLS].values)
+    hnei_scaler, hnei_lower, hnei_upper = fit_scaler(hnei_segments)
+    nasa_scaler, nasa_lower, nasa_upper = fit_scaler(nasa_train_battery)
 
-    nasa_feat_scaler = StandardScaler()
-    nasa_feat_scaler.fit(nasa_train_battery[0][FEATURE_COLS].values)
-
-    hnei_scaled       = scale_segments(hnei_segments,    hnei_feat_scaler)
-    nasa_train_scaled = scale_segments(nasa_train_battery, nasa_feat_scaler)
-    nasa_test_scaled  = scale_segments(nasa_test_segs,   nasa_feat_scaler)
+    hnei_scaled       = scale_segments(hnei_segments,     hnei_scaler, hnei_lower, hnei_upper)
+    nasa_train_scaled = scale_segments(nasa_train_battery, nasa_scaler, nasa_lower, nasa_upper)
+    nasa_test_scaled  = scale_segments(nasa_test_segs,    nasa_scaler, nasa_lower, nasa_upper)
 
     # --- build windows ---
     X_nasa_train, y_nasa_train = build_sliding_windows(nasa_train_scaled, WINDOW_SIZE)

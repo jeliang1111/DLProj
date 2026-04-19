@@ -6,14 +6,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 HNEI_DATA_PATH = "Battery_RUL_Cleaned.csv"
 NASA_DATA_PATH = "nasa_battery_cycles.csv"
-WINDOW_SIZE = 10
+HNEI_WINDOW_SIZE = 15
+NASA_WINDOW_SIZE = 15
 BATCH_SIZE  = 256
 LATENT_DIM  = 32
 LR          = 1e-3
@@ -22,11 +23,11 @@ VAE_EPOCHS      = 50
 FINETUNE_EPOCHS = 100
 BASELINE_EPOCHS = 50
 
-NUM_FINETUNE_BATTERIES = 5
+NUM_FINETUNE_BATTERIES = 1
 
 # Set to "HNEI" to train on HNEI and transfer to NASA,
 # or "NASA" to train on NASA and transfer to HNEI.
-SOURCE_DOMAIN = "HNEI"
+SOURCE_DOMAIN = "NASA"
 
 CKPT_VAE       = f"checkpoint_vae_{SOURCE_DOMAIN}.pt"
 CKPT_TRANSFER  = f"checkpoint_transfer_{SOURCE_DOMAIN}.pt"
@@ -398,8 +399,8 @@ def main():
     print(f"Demo batteries reserved — HNEI: 1, NASA: 1")
 
     # save demo battery windows so the Streamlit app can load them directly
-    demo_hnei_windows, demo_hnei_labels = build_sliding_windows([demo_hnei], WINDOW_SIZE)
-    demo_nasa_windows, demo_nasa_labels = build_sliding_windows([demo_nasa], WINDOW_SIZE)
+    demo_hnei_windows, demo_hnei_labels = build_sliding_windows([demo_hnei], HNEI_WINDOW_SIZE)
+    demo_nasa_windows, demo_nasa_labels = build_sliding_windows([demo_nasa], NASA_WINDOW_SIZE)
     np.savez(
         DEMO_DATA_PATH,
         hnei_windows=demo_hnei_windows, hnei_labels=demo_hnei_labels,
@@ -412,8 +413,11 @@ def main():
         source_segments, target_segments = hnei_segments, nasa_segments
     else:
         source_segments, target_segments = nasa_segments, hnei_segments
-    target_name = "NASA" if SOURCE_DOMAIN == "HNEI" else "HNEI"
+    target_name        = "NASA" if SOURCE_DOMAIN == "HNEI" else "HNEI"
+    source_window_size = HNEI_WINDOW_SIZE if SOURCE_DOMAIN == "HNEI" else NASA_WINDOW_SIZE
+    target_window_size = NASA_WINDOW_SIZE if SOURCE_DOMAIN == "HNEI" else HNEI_WINDOW_SIZE
     print(f"Transfer direction: {SOURCE_DOMAIN} → {target_name}")
+    print(f"Window sizes — source: {source_window_size}, target: {target_window_size}")
 
     # --- split target domain: fine-tune set + test set ---
     # Select the batteries with the most cycles for fine-tuning (most data = best adaptation signal).
@@ -431,31 +435,58 @@ def main():
     source_val_segs     = source_shuffled[:n_source_val]
     print(f"{SOURCE_DOMAIN} source split — train: {len(source_train_segs)}, val: {len(source_val_segs)}")
 
-    # --- feature scaling: fit StandardScaler on source training segments only ---
-    feat_scaler = StandardScaler()
-    source_train_features = pd.concat(source_train_segs)[FEATURE_COLS].values
-    feat_scaler.fit(source_train_features)
-
-    def scale_segments(segs: list[pd.DataFrame]) -> list[pd.DataFrame]:
-        scaled = []
-        for seg in segs:
+    # Each domain gets its own MinMaxScaler to avoid cross-domain distortion.
+    # Outliers are clipped to [1st, 99th] percentile before fitting so a single
+    # extreme value doesn't compress the entire distribution into a tiny range.
+    def fit_and_scale(train_segs: list[pd.DataFrame], all_segs_to_transform: list) -> list:
+        train_vals = pd.concat(train_segs)[FEATURE_COLS].values
+        lower = np.percentile(train_vals, 1, axis=0)
+        upper = np.percentile(train_vals, 99, axis=0)
+        scaler = MinMaxScaler()
+        scaler.fit(np.clip(train_vals, lower, upper))
+        result = []
+        for seg in all_segs_to_transform:
             s = seg.copy()
-            s[FEATURE_COLS] = feat_scaler.transform(s[FEATURE_COLS].values)
-            scaled.append(s)
-        return scaled
+            clipped = np.clip(s[FEATURE_COLS].values, lower, upper)
+            s[FEATURE_COLS] = scaler.transform(clipped)
+            result.append(s)
+        return result
 
-    source_train_segs = scale_segments(source_train_segs)
-    source_val_segs   = scale_segments(source_val_segs)
-    target_finetune   = scale_segments(target_finetune)
-    target_test       = scale_segments(target_test)
-    demo_hnei         = scale_segments([demo_hnei])[0]
-    demo_nasa         = scale_segments([demo_nasa])[0]
+    source_segs_scaled = fit_and_scale(
+        source_train_segs,
+        source_train_segs + source_val_segs,
+    )
+    n_train = len(source_train_segs)
+    source_train_segs = source_segs_scaled[:n_train]
+    source_val_segs   = source_segs_scaled[n_train:]
+
+    target_segs_scaled = fit_and_scale(
+        target_finetune,
+        target_finetune + target_test,
+    )
+    n_ft = len(target_finetune)
+    target_finetune = target_segs_scaled[:n_ft]
+    target_test     = target_segs_scaled[n_ft:]
+
+    # demo batteries scaled within their own domain with the same outlier clipping
+    def scale_single(seg: pd.DataFrame) -> pd.DataFrame:
+        vals = seg[FEATURE_COLS].values
+        lower = np.percentile(vals, 1, axis=0)
+        upper = np.percentile(vals, 99, axis=0)
+        scaler = MinMaxScaler()
+        scaler.fit(np.clip(vals, lower, upper))
+        s = seg.copy()
+        s[FEATURE_COLS] = scaler.transform(np.clip(vals, lower, upper))
+        return s
+
+    demo_hnei = scale_single(demo_hnei)
+    demo_nasa = scale_single(demo_nasa)
 
     # --- build window arrays ---
-    X_source,      y_source      = build_sliding_windows(source_train_segs, WINDOW_SIZE)
-    X_source_val,  y_source_val  = build_sliding_windows(source_val_segs,   WINDOW_SIZE)
-    X_finetune,    y_finetune    = build_sliding_windows(target_finetune,    WINDOW_SIZE)
-    X_target_test, y_target_test = build_sliding_windows(target_test,        WINDOW_SIZE)
+    X_source,      y_source      = build_sliding_windows(source_train_segs, source_window_size)
+    X_source_val,  y_source_val  = build_sliding_windows(source_val_segs,   source_window_size)
+    X_finetune,    y_finetune    = build_sliding_windows(target_finetune,    target_window_size)
+    X_target_test, y_target_test = build_sliding_windows(target_test,        target_window_size)
 
     # source_scaler: fit on source training labels → used for VAE + baseline training.
     # target_scaler: fit on fine-tune labels only → used for transfer fine-tuning + evaluation.
@@ -484,7 +515,7 @@ def main():
     print(f"Phase 1: VAE training on {SOURCE_DOMAIN} data")
     print("=" * 60)
 
-    vae       = BatteryVAE(NUM_FEATURES, WINDOW_SIZE, LATENT_DIM).to(device)
+    vae       = BatteryVAE(NUM_FEATURES, source_window_size, LATENT_DIM).to(device)
     vae_optim = torch.optim.Adam(vae.parameters(), lr=LR, weight_decay=1e-4)
 
     def train_vae():
@@ -586,14 +617,14 @@ def main():
     # Each demo battery is evaluated in its own domain's scale.
     # HNEI demo → source_scaler; NASA demo → target_scaler (or reversed when SOURCE_DOMAIN="NASA").
     demo_configs = [
-        (demo_hnei, "Demo HNEI Battery", source_scaler if SOURCE_DOMAIN == "HNEI" else target_scaler),
-        (demo_nasa, "Demo NASA Battery", target_scaler if SOURCE_DOMAIN == "HNEI" else source_scaler),
+        (demo_hnei, "Demo HNEI Battery", source_scaler if SOURCE_DOMAIN == "HNEI" else target_scaler, HNEI_WINDOW_SIZE),
+        (demo_nasa, "Demo NASA Battery", target_scaler if SOURCE_DOMAIN == "HNEI" else source_scaler, NASA_WINDOW_SIZE),
     ]
 
     _, demo_axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    for ax, (demo_seg, title, demo_scaler) in zip(demo_axes, demo_configs):
-        X_demo, y_demo = build_sliding_windows([demo_seg], WINDOW_SIZE)
+    for ax, (demo_seg, title, demo_scaler, demo_ws) in zip(demo_axes, demo_configs):
+        X_demo, y_demo = build_sliding_windows([demo_seg], demo_ws)
         y_demo_norm    = demo_scaler.transform(y_demo)
         demo_loader    = make_loader(X_demo, y_demo_norm, shuffle=False)
 

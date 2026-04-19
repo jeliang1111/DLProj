@@ -8,7 +8,10 @@
       "Bash(pip3 install:*)",
       "Bash(python3 -c \"import xgboost; print\\(xgboost.__version__\\)\")",
       "Bash(python3 -c ' *)",
-      "Bash(python nasa_few_shot_comparison.py)"
+      "Bash(python nasa_few_shot_comparison.py)",
+      "Bash(python cnn_vae_transfer.py)",
+      "Bash(sed -i '' 's/HNEI_WINDOW_SIZE = 30/HNEI_WINDOW_SIZE = 15/' /Users/caoqian/Desktop/DLProj/cnn_vae_transfer.py)",
+      "Bash(sed -i '' 's/NASA_WINDOW_SIZE = 30/NASA_WINDOW_SIZE = 15/' /Users/caoqian/Desktop/DLProj/cnn_vae_transfer.py)"
     ],
     "additionalDirectories": [
       "/Users/caoqian/Desktop/DLProj"
