@@ -10,7 +10,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 # Config
 # ---------------------------------------------------------------------------
 DATA_PATH         = "combined_scaled_battery_data.csv"
-WINDOW_SIZE       = 30
+CKPT_PATH         = "checkpoint_cnn_rul.pt"
+WINDOW_SIZE       = 10
 NUM_TEST_BATTERIES = 8
 BATCH_SIZE        = 256
 NUM_EPOCHS        = 50
@@ -208,9 +209,22 @@ def main():
 
     battery_segments = split_into_battery_segments(df)
 
+    rng = np.random.default_rng(42)
+
+    # --- reserve 1 CALCE + 1 NASA battery for demo, exclude from all training/testing ---
+    all_calce = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 0]
+    all_nasa  = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 1]
+    demo_calce = all_calce[rng.integers(len(all_calce))]
+    demo_nasa  = all_nasa[rng.integers(len(all_nasa))]
+    demo_df = pd.concat([demo_calce, demo_nasa], ignore_index=True)
+    demo_df.to_csv("demo_batteries_cnn.csv", index=False)
+    print(f"Demo batteries saved to demo_batteries_cnn.csv "
+          f"(CALCE: {len(demo_calce)} cycles, NASA: {len(demo_nasa)} cycles)")
+    battery_segments = [s for s in battery_segments
+                        if not s.equals(demo_calce) and not s.equals(demo_nasa)]
+
     # Stratified split: sample test batteries from each source (CALCE + NASA)
     # to avoid testing entirely on an unseen data distribution.
-    rng = np.random.default_rng(42)
     calce_indices = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 0]
     nasa_indices  = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 1]
 
@@ -245,16 +259,23 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {total_params:,}")
 
-    # --- training loop ---
+    # --- training loop (skip if checkpoint exists) ---
+    import os
     train_losses, val_losses = [], []
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, _, _ = evaluate(model, test_loader, criterion, device)
-        scheduler.step()
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train_loss={train_loss:.2f}  val_loss={val_loss:.2f}")
+    if os.path.exists(CKPT_PATH):
+        model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
+        print(f"Loaded checkpoint from {CKPT_PATH}, skipping training.")
+    else:
+        for epoch in range(1, NUM_EPOCHS + 1):
+            train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, _, _ = evaluate(model, test_loader, criterion, device)
+            scheduler.step()
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train_loss={train_loss:.2f}  val_loss={val_loss:.2f}")
+        torch.save(model.state_dict(), CKPT_PATH)
+        print(f"Checkpoint saved to {CKPT_PATH}")
 
     # --- final evaluation ---
     _, cnn_preds, cnn_labels = evaluate(model, test_loader, criterion, device)
@@ -262,37 +283,21 @@ def main():
     print(f"CNN  RMSE: {np.sqrt(mean_squared_error(cnn_labels, cnn_preds)):.4f}")
     print(f"CNN  R^2:  {r2_score(cnn_labels, cnn_preds):.4f}")
 
-    # --- plots ---
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    # --- plot: predicted vs true only ---
+    fig, ax = plt.subplots(figsize=(6, 6))
 
-    axes[0].plot(train_losses, label="Train")
-    axes[0].plot(val_losses,   label="Val")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MSE Loss")
-    axes[0].set_title("Training Curve")
-    axes[0].legend()
-    axes[0].grid(True)
-
-    axes[1].scatter(cnn_labels, cnn_preds, alpha=0.3, s=10)
+    ax.scatter(cnn_labels, cnn_preds, alpha=0.3, s=10)
     min_val, max_val = cnn_labels.min(), cnn_labels.max()
-    axes[1].plot([min_val, max_val], [min_val, max_val], linestyle="--", color="red")
-    axes[1].set_xlabel("True RUL")
-    axes[1].set_ylabel("Predicted RUL")
-    axes[1].set_title("Predicted vs True RUL")
-    axes[1].grid(True)
-
-    residuals = cnn_preds - cnn_labels
-    axes[2].hist(residuals, bins=50, edgecolor="black")
-    axes[2].axvline(0, color="red", linestyle="--")
-    axes[2].set_xlabel("Residual (Predicted - True)")
-    axes[2].set_ylabel("Count")
-    axes[2].set_title("Residual Distribution")
-    axes[2].grid(True)
+    ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="red")
+    ax.set_xlabel("True RUL")
+    ax.set_ylabel("Predicted RUL")
+    ax.set_title("Predicted vs True RUL (CNN)")
+    ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig("cnn_results.png", dpi=150)
+    plt.savefig("cnn_pred_vs_true.png", dpi=150)
     plt.show()
-    print("Plot saved to cnn_results.png")
+    print("Plot saved to cnn_pred_vs_true.png")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2 @@
+nasa_weight,hnei_weight,best_epoch,best_val_loss,test_mse,output_dir,checkpoint_path,overall_mae,overall_rmse,overall_r2,hnei_n,hnei_mae,hnei_rmse,hnei_r2,nasa_n,nasa_mae,nasa_rmse,nasa_r2
+1.5,1.0,31,4031.8824819606907,11479.579761384663,tft_nasa_weight_sweep/nasa_weight_1p5,tft_nasa_weight_sweep/nasa_weight_1p5/checkpoints/best_model.pt,76.49612426757812,107.14280682662509,0.8958715796470642,4213,81.45135498046875,111.32468525387799,0.8771176338195801,347,16.3336181640625,19.679892968607817,0.7754687666893005
