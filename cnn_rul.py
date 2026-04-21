@@ -177,11 +177,12 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
-    total_loss = 0.0
-    all_preds  = []
-    all_labels = []
+    total_loss  = 0.0
+    all_preds   = []
+    all_labels  = []
+    all_is_nasa = []
     with torch.no_grad():
         for batch_seq, batch_static, batch_y in loader:
             batch_seq, batch_static, batch_y = (
@@ -191,8 +192,14 @@ def evaluate(
             total_loss += criterion(preds, batch_y).item() * len(batch_y)
             all_preds.append(preds.cpu().numpy())
             all_labels.append(batch_y.cpu().numpy())
+            all_is_nasa.append(batch_static.cpu().numpy())
     avg_loss = total_loss / len(loader.dataset)
-    return avg_loss, np.concatenate(all_preds).flatten(), np.concatenate(all_labels).flatten()
+    return (
+        avg_loss,
+        np.concatenate(all_preds).flatten(),
+        np.concatenate(all_labels).flatten(),
+        np.concatenate(all_is_nasa).flatten(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +275,7 @@ def main():
     else:
         for epoch in range(1, NUM_EPOCHS + 1):
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, _, _ = evaluate(model, test_loader, criterion, device)
+            val_loss, _, _, _ = evaluate(model, test_loader, criterion, device)
             scheduler.step()
             train_losses.append(train_loss)
             val_losses.append(val_loss)
@@ -278,20 +285,27 @@ def main():
         print(f"Checkpoint saved to {CKPT_PATH}")
 
     # --- final evaluation ---
-    _, cnn_preds, cnn_labels = evaluate(model, test_loader, criterion, device)
+    _, cnn_preds, cnn_labels, cnn_is_nasa = evaluate(model, test_loader, criterion, device)
     print(f"\nCNN  MAE:  {mean_absolute_error(cnn_labels, cnn_preds):.4f}")
     print(f"CNN  RMSE: {np.sqrt(mean_squared_error(cnn_labels, cnn_preds)):.4f}")
     print(f"CNN  R^2:  {r2_score(cnn_labels, cnn_preds):.4f}")
 
-    # --- plot: predicted vs true only ---
+    # --- plot: predicted vs true, color-coded by dataset source ---
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    ax.scatter(cnn_labels, cnn_preds, alpha=0.3, s=10)
+    calce_mask = cnn_is_nasa == 0
+    nasa_mask  = cnn_is_nasa == 1
+    ax.scatter(cnn_labels[calce_mask], cnn_preds[calce_mask],
+               alpha=0.3, s=10, color="steelblue", label="CALCE")
+    ax.scatter(cnn_labels[nasa_mask],  cnn_preds[nasa_mask],
+               alpha=0.3, s=10, color="darkorange", label="NASA")
+
     min_val, max_val = cnn_labels.min(), cnn_labels.max()
     ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="red")
     ax.set_xlabel("True RUL")
     ax.set_ylabel("Predicted RUL")
     ax.set_title("Predicted vs True RUL (CNN)")
+    ax.legend()
     ax.grid(True)
 
     plt.tight_layout()

@@ -21,7 +21,7 @@ LR          = 1e-3
 
 VAE_EPOCHS      = 50
 FINETUNE_EPOCHS = 100
-BASELINE_EPOCHS = 100   # more epochs to give baseline a fair chance with limited data
+BASELINE_EPOCHS = 100
 
 CKPT_VAE      = "ckpt_fewshot_vae.pt"
 CKPT_TRANSFER = "ckpt_fewshot_transfer.pt"
@@ -248,17 +248,6 @@ def train_vae_epoch(vae, loader, optimizer, device) -> float:
         loss.backward()
         optimizer.step()
         total += loss.item() * len(x)
-    return total / len(loader.dataset)
-
-
-def eval_vae_epoch(vae, loader, device) -> float:
-    vae.eval()
-    total = 0.0
-    with torch.no_grad():
-        for x, _ in loader:
-            x = x.to(device)
-            x_recon, mu, log_var = vae(x)
-            total += vae_loss(x_recon, x, mu, log_var).item() * len(x)
     return total / len(loader.dataset)
 
 
