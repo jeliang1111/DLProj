@@ -1,0 +1,31 @@
+{
+  "overall": {
+    "mae": 39.993927001953125,
+    "rmse": 90.61609870078274,
+    "r2": 0.9352531433105469
+  },
+  "best_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/demo_tft_transformer_balanced_nasa_weight_12p0-epoch=04-val_loss=45.5231-v1.ckpt",
+  "stable_checkpoint_path": "model_checkpoints/demo_tft_transformer_balanced.ckpt",
+  "last_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/last-v1.ckpt",
+  "best_val_loss": 45.52312088012695,
+  "nasa_weight": 12.0,
+  "window": 10,
+  "max_encoder_length": 10,
+  "max_prediction_length": 1,
+  "train_samples": 13821,
+  "val_samples": 1794,
+  "test_samples": 2899,
+  "log_dir": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/demo_tft_transformer_balanced_nasa_weight_12p0/version_1",
+  "HNEI / CALCE": {
+    "mae": 26.380752563476562,
+    "rmse": 30.366147356446742,
+    "r2": 0.9913716316223145,
+    "n": 2213
+  },
+  "NASA": {
+    "mae": 83.9093017578125,
+    "rmse": 178.11730246525744,
+    "r2": -7.904476165771484,
+    "n": 686
+  }
+}
