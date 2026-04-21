@@ -1,14 +1,19 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"       # prevent XGBoost from spawning OMP workers
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
-import numpy as np
-import pandas as pd
+import torch.nn.functional as F
+import joblib
 import plotly.graph_objects as go
-import os
-import pickle
 
-# ── Feature metadata ──────────────────────────────────────────────────────────
-FEATURE_NAMES = [
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+FEATURE_COLS = [
     "Discharge Time (s)",
     "Decrement 3.6-3.4V (s)",
     "Max. Voltage Dischar. (V)",
@@ -17,230 +22,299 @@ FEATURE_NAMES = [
     "Time constant current (s)",
     "Charging time (s)",
 ]
-FEATURE_KEYS = [f"F{i+1}" for i in range(7)]
-DATA_PATH = "combined_scaled_battery_data.csv"
 
-# ── Model definitions (must match training architecture) ──────────────────────
+CKPT_CNN  = "checkpoints/checkpoint_cnn_rul.pt"
+CKPT_XGB  = "checkpoints/xgboost_baseline_best.joblib"
+CKPT_TFT  = "checkpoints/tft_nasa_weight_2p0_checkpoint.pt"
 
-class CNNModel(nn.Module):
-    def __init__(self, input_size=7):
+DATASETS = {
+    "HNEI": ("HNEI_STANDARD_SCALED.csv", 0),
+    "NASA": ("NASA_STANDARD_SCALED.csv", 1),
+}
+
+WINDOW_SIZE = 10  # cycles passed to each model
+
+# ── Model definitions ─────────────────────────────────────────────────────────
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * input_size, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
+        self.conv = nn.Conv1d(in_ch, out_ch, k, padding=k // 2)
+        self.bn   = nn.BatchNorm1d(out_ch)
+        self.relu = nn.ReLU()
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+class CNNWithStatic(nn.Module):
+    """Matches checkpoint_cnn_rul.pt: ConvEncoder + Is_NASA static branch."""
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            ConvBlock(7, 64),    # encoder.0
+            ConvBlock(64, 128),  # encoder.1
+            nn.MaxPool1d(2),     # encoder.2
+            ConvBlock(128, 128), # encoder.3
+            ConvBlock(128, 64),  # encoder.4
+        )
+        self.pool           = nn.AdaptiveAvgPool1d(1)
+        self.static_encoder = nn.Sequential(nn.Linear(1, 8), nn.ReLU())
+        self.regressor      = nn.Sequential(
+            nn.Linear(72, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1)
         )
 
-    def forward(self, x):
-        x = x.unsqueeze(1)  # (B, 1, 7)
-        return self.net(x).squeeze(-1)
+    def forward(self, x, is_nasa):
+        h = self.pool(self.encoder(x)).squeeze(-1)          # (B, 64)
+        s = self.static_encoder(is_nasa.view(-1, 1)).view(h.shape[0], -1)  # (B, 8)
+        return self.regressor(torch.cat([h, s], dim=1))                  # (B, 1)
 
+# ── TFT Hybrid (CNN + simplified Temporal Fusion) ─────────────────────────────
 
-class TFTModel(nn.Module):
-    """Simplified TFT-style model using transformer encoder."""
-    def __init__(self, input_size=7, d_model=32, nhead=4, num_layers=2):
+class _TFTConvBlock(nn.Module):
+    """ConvBlock matching state dict layout: .block.0 = Conv1d, .block.1 = BN."""
+    def __init__(self, in_ch, out_ch, k=3):
         super().__init__()
-        self.input_proj = nn.Linear(1, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(d_model * input_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
+        self.block = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, k, padding=k // 2),
+            nn.BatchNorm1d(out_ch),
+        )
+    def forward(self, x):
+        return F.relu(self.block(x))
+
+class _GRN(nn.Module):
+    def __init__(self, dim=64):
+        super().__init__()
+        self.fc1  = nn.Linear(dim, dim)
+        self.fc2  = nn.Linear(dim, dim)
+        self.gate = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, x):
+        h = F.elu(self.fc1(x))
+        h = self.fc2(h)
+        g = torch.sigmoid(self.gate(x))
+        return self.norm(g * h + (1 - g) * x)
+
+class _GatedAddNorm(nn.Module):
+    def __init__(self, dim=64):
+        super().__init__()
+        self.gate = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, x, residual):
+        g = torch.sigmoid(self.gate(x))
+        return self.norm(g * x + residual)
+
+class _TemporalFusion(nn.Module):
+    def __init__(self, dim=64, n_heads=4):
+        super().__init__()
+        self.input_grn                = _GRN(dim)
+        self.lstm                     = nn.LSTM(dim, dim, batch_first=False)
+        self.post_lstm_gate_norm      = _GatedAddNorm(dim)
+        self.attention                = nn.MultiheadAttention(dim, n_heads, batch_first=False)
+        self.post_attention_gate_norm = _GatedAddNorm(dim)
+        self.positionwise_grn         = _GRN(dim)
+
+class TFTHybrid(nn.Module):
+    """Matches tft_nasa_weight_2p0_checkpoint.pt: 3×ConvBlock → TemporalFusion → static → head."""
+    def __init__(self):
+        super().__init__()
+        self.conv_feature_extractor = nn.ModuleList([
+            _TFTConvBlock(7, 64),
+            _TFTConvBlock(64, 64),
+            _TFTConvBlock(64, 64),
+        ])
+        self.temporal_fusion = _TemporalFusion(64, 4)
+        self.static_branch   = nn.Sequential(nn.Linear(1, 8), nn.ReLU())
+        self.regression_head = nn.Sequential(
+            nn.Linear(72, 64), nn.ReLU(), nn.Linear(64, 1)
         )
 
-    def forward(self, x):
-        x = x.unsqueeze(-1)          # (B, 7, 1)
-        x = self.input_proj(x)       # (B, 7, d_model)
-        x = self.transformer(x)
-        return self.head(x).squeeze(-1)
+    def forward(self, x, is_nasa):
+        for blk in self.conv_feature_extractor:
+            x = blk(x)                                           # (B, 64, W)
+        x = x.permute(2, 0, 1)                                  # (W, B, 64)
 
+        tf = self.temporal_fusion
+        x_grn = tf.input_grn(x)                                 # (W, B, 64)
+        lstm_out, _ = tf.lstm(x_grn)                            # (W, B, 64)
+        x_lstm = tf.post_lstm_gate_norm(lstm_out, x_grn)        # (W, B, 64)
+        attn_out, _ = tf.attention(x_lstm, x_lstm, x_lstm)      # (W, B, 64)
+        x_attn = tf.post_attention_gate_norm(attn_out, x_lstm)  # (W, B, 64)
+        x_out  = tf.positionwise_grn(x_attn)                    # (W, B, 64)
+
+        h = x_out[-1]                                           # (B, 64) last step
+        s = self.static_branch(is_nasa.view(-1, 1))             # (B, 8)
+        return self.regression_head(torch.cat([h, s], dim=1))   # (B, 1)
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def load_cnn(path="checkpoints/cnn_model.pt"):
-    model = CNNModel()
-    model.load_state_dict(torch.load(path, map_location="cpu"))
+def load_cnn():
+    model = CNNWithStatic()
+    model.load_state_dict(torch.load(CKPT_CNN, map_location="cpu", weights_only=True))
     model.eval()
     return model
 
 @st.cache_resource
-def load_tft(path="checkpoints/tft_model.pt"):
-    model = TFTModel()
-    model.load_state_dict(torch.load(path, map_location="cpu"))
-    model.eval()
-    return model
+def load_xgb():
+    return joblib.load(CKPT_XGB)
 
 @st.cache_resource
-def load_xgb(path="checkpoints/xgb_model.pkl"):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def load_tft():
+    model = TFTHybrid()
+    ckpt  = torch.load(CKPT_TFT, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model
 
 @st.cache_data
-def load_data():
-    df = pd.read_csv(DATA_PATH)
-    feature_cols = FEATURE_NAMES
-    df = df[feature_cols + ["RUL"]].dropna()
-    return df
+def load_dataset(name):
+    path, _ = DATASETS[name]
+    return pd.read_csv(path)
 
+# ── Inference helpers ─────────────────────────────────────────────────────────
 
-def predict_all(features: np.ndarray, cnn, tft, xgb):
-    tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+def predict_cnn(model, window_np, is_nasa_val):
+    """window_np: (WINDOW_SIZE, 7)"""
+    x = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
+    isn = torch.tensor([[is_nasa_val]], dtype=torch.float32)          # (1, 1)
     with torch.no_grad():
-        cnn_pred = cnn(tensor).item()
-        tft_pred = tft(tensor).item()
-    xgb_pred = xgb.predict(features.reshape(1, -1))[0]
-    return {"CNN": cnn_pred, "TFT": tft_pred, "XGBoost": xgb_pred}
+        return max(0.0, model(x, isn).item())
 
+def predict_xgb(bundle, last_row_np):
+    """last_row_np: (7,) — XGBoost is a per-cycle model, use last cycle of window."""
+    X = last_row_np.reshape(1, -1).astype(np.float32)
+    # Replace any NaN with column median as fallback (imputer has sklearn version mismatch)
+    col_medians = np.nanmedian(X, axis=0)
+    nan_mask = np.isnan(X)
+    X[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+    return max(0.0, float(bundle["model"].predict(X)[0]))
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+def predict_tft(model, window_np, is_nasa_val):
+    """window_np: (WINDOW_SIZE, 7)"""
+    x   = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
+    isn = torch.tensor([[is_nasa_val]], dtype=torch.float32)
+    with torch.no_grad():
+        return max(0.0, model(x, isn).item())
 
-st.set_page_config(page_title="Battery RUL Predictor", layout="wide")
-st.title("Battery Remaining Useful Life (RUL) Predictor")
+# ── Page setup ────────────────────────────────────────────────────────────────
 
-# Check which checkpoints exist
-checkpoint_dir = "checkpoints"
-cnn_ready = os.path.exists(f"{checkpoint_dir}/cnn_model.pt")
-tft_ready = os.path.exists(f"{checkpoint_dir}/tft_model.pt")
-xgb_ready = os.path.exists(f"{checkpoint_dir}/xgb_model.pkl")
-models_ready = cnn_ready and tft_ready and xgb_ready
+st.set_page_config(page_title="Battery RUL Prediction", layout="wide")
+st.title("Battery RUL Prediction")
 
-if not models_ready:
-    missing = [
-        name for name, ready in [("CNN (cnn_model.pt)", cnn_ready),
-                                   ("TFT (tft_model.pt)", tft_ready),
-                                   ("XGBoost (xgb_model.pkl)", xgb_ready)]
-        if not ready
-    ]
-    st.warning(f"Missing checkpoints: {', '.join(missing)}. Place them in `{checkpoint_dir}/` to enable inference.")
+# Check all checkpoints
+missing = [n for n, p in [("CNN", CKPT_CNN), ("XGBoost", CKPT_XGB), ("TFT", CKPT_TFT)]
+           if not os.path.exists(p)]
+if missing:
+    st.error(f"Missing checkpoints: {', '.join(missing)}")
+    st.stop()
 
-# ── Sidebar: feature sliders ──────────────────────────────────────────────────
-st.sidebar.header("Cycle Feature Inputs")
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.header("Settings")
 
-# Compute per-feature ranges from data for sensible slider bounds
-if os.path.exists(DATA_PATH):
-    df = load_data()
-    feature_stats = {col: (df[col].min(), df[col].max(), df[col].mean())
-                     for col in FEATURE_NAMES}
-else:
-    df = None
-    feature_stats = {col: (-5.0, 5.0, 0.0) for col in FEATURE_NAMES}
+dataset_name = st.sidebar.radio("Dataset", list(DATASETS.keys()))
+model_choice = st.sidebar.radio("Model", ["CNN", "XGBoost", "TFT", "All"])
 
-input_values = {}
-for key, name in zip(FEATURE_KEYS, FEATURE_NAMES):
-    lo, hi, default = feature_stats[name]
-    input_values[key] = st.sidebar.slider(
-        label=f"{key}: {name}",
-        min_value=float(lo),
-        max_value=float(hi),
-        value=float(default),
-        step=float((hi - lo) / 200),
-        format="%.4f",
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Window size:** {WINDOW_SIZE} cycles")
+st.sidebar.markdown(f"**Predicts:** RUL at cycle {WINDOW_SIZE + 1}")
+
+# ── Session state for sampled window ──────────────────────────────────────────
+state_key = f"start_{dataset_name}"
+if state_key not in st.session_state:
+    st.session_state[state_key] = None
+
+if st.sidebar.button("Random Sample", type="primary"):
+    df_full = load_dataset(dataset_name)
+    max_start = len(df_full) - WINDOW_SIZE - 1
+    if max_start < 0:
+        st.warning(f"Dataset too short (need > {WINDOW_SIZE + 1} rows).")
+        st.stop()
+    st.session_state[state_key] = int(np.random.randint(0, max_start + 1))
+
+start = st.session_state[state_key]
+
+if start is None:
+    st.info("Select a dataset and model, then click **Random Sample**.")
+    st.stop()
+
+# ── Extract window ────────────────────────────────────────────────────────────
+df_full   = load_dataset(dataset_name)
+_, is_nasa = DATASETS[dataset_name]
+
+window_df = df_full.iloc[start : start + WINDOW_SIZE].copy()
+true_rul  = float(df_full.iloc[start + WINDOW_SIZE]["RUL"])
+window_np = window_df[FEATURE_COLS].values.astype(np.float32)
+
+st.markdown(
+    f"**Dataset:** {dataset_name} &nbsp;|&nbsp; "
+    f"**Sampled rows:** {start}–{start + WINDOW_SIZE - 1} &nbsp;|&nbsp; "
+    f"**Predicting RUL at row:** {start + WINDOW_SIZE}"
+)
+
+# ── Run inference ─────────────────────────────────────────────────────────────
+cnn_model = load_cnn()
+xgb_bundle = load_xgb()
+tft_model = load_tft()
+
+run_cnn = model_choice in ("CNN", "All")
+run_xgb = model_choice in ("XGBoost", "All")
+run_tft = model_choice in ("TFT", "All")
+
+results = {}
+errors  = {}
+
+if run_cnn:
+    results["CNN"] = predict_cnn(cnn_model, window_np, is_nasa)
+
+if run_xgb:
+    results["XGBoost"] = predict_xgb(xgb_bundle, window_np[-1])
+
+if run_tft:
+    results["TFT"] = predict_tft(tft_model, window_np, is_nasa)
+
+# ── Metric cards ──────────────────────────────────────────────────────────────
+model_colors = {"CNN": "#4C9BE8", "XGBoost": "#2A9D8F", "TFT": "#F4A261"}
+
+num_cols = 1 + len(results) + len(errors)
+metric_cols = st.columns(num_cols)
+metric_cols[0].metric("True RUL", f"{true_rul:.1f} cycles")
+
+for i, (name, pred) in enumerate(results.items(), 1):
+    err = pred - true_rul
+    metric_cols[i].metric(name, f"{pred:.1f} cycles", delta=f"{err:+.1f}", delta_color="inverse")
+
+for name, msg in errors.items():
+    st.warning(f"**{name} error:** {msg}")
+
+# ── Bar chart ─────────────────────────────────────────────────────────────────
+if results:
+    st.subheader("Predicted vs. True RUL")
+
+    names  = ["True RUL"] + list(results.keys())
+    values = [true_rul]   + list(results.values())
+    colors = ["#888888"]  + [model_colors[n] for n in results]
+
+    fig = go.Figure(go.Bar(
+        x=names, y=values,
+        marker_color=colors,
+        text=[f"{v:.1f}" for v in values],
+        textposition="outside",
+        width=0.45,
+    ))
+    fig.add_hline(y=true_rul, line_dash="dot", line_color="gray",
+                  annotation_text="True RUL", annotation_position="top right")
+    fig.update_layout(
+        yaxis_title="RUL (cycles)",
+        height=380,
+        margin=dict(t=40, b=40),
+        showlegend=False,
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-features_array = np.array([input_values[k] for k in FEATURE_KEYS], dtype=np.float32)
-
-predict_btn = st.sidebar.button("Predict RUL", type="primary", disabled=not models_ready)
-
-# ── Main area ─────────────────────────────────────────────────────────────────
-col_metrics, col_scatter = st.columns([1, 2])
-
-if predict_btn and models_ready:
-    cnn_model = load_cnn()
-    tft_model = load_tft()
-    xgb_model = load_xgb()
-
-    preds = predict_all(features_array, cnn_model, tft_model, xgb_model)
-
-    with col_metrics:
-        st.subheader("Predicted RUL")
-        colors = {"CNN": "#4C9BE8", "TFT": "#F4A261", "XGBoost": "#2A9D8F"}
-        for model_name, pred in preds.items():
-            st.metric(label=model_name, value=f"{pred:.1f} cycles")
-
-        # Bar chart comparison
-        fig_bar = go.Figure(go.Bar(
-            x=list(preds.keys()),
-            y=list(preds.values()),
-            marker_color=list(colors.values()),
-            text=[f"{v:.1f}" for v in preds.values()],
-            textposition="outside",
-        ))
-        fig_bar.update_layout(
-            yaxis_title="Predicted RUL (cycles)",
-            height=300,
-            margin=dict(t=20, b=20),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    with col_scatter:
-        if df is not None:
-            st.subheader("Predicted vs. True RUL — Dataset Overview")
-
-            # Sample for performance
-            sample = df.sample(min(2000, len(df)), random_state=42)
-            X_sample = sample[FEATURE_NAMES].values.astype(np.float32)
-            y_true = sample["RUL"].values
-
-            cnn_model = load_cnn()
-            tft_model = load_tft()
-            xgb_model = load_xgb()
-
-            with torch.no_grad():
-                t = torch.tensor(X_sample)
-                cnn_preds = cnn_model(t).numpy()
-                tft_preds = tft_model(t).numpy()
-            xgb_preds = xgb_model.predict(X_sample)
-
-            model_preds_map = {"CNN": cnn_preds, "TFT": tft_preds, "XGBoost": xgb_preds}
-            scatter_model = st.selectbox("Show scatter for:", list(model_preds_map.keys()))
-            y_pred_scatter = model_preds_map[scatter_model]
-
-            current_pred = preds[scatter_model]
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=y_true, y=y_pred_scatter, mode="markers",
-                marker=dict(color=colors[scatter_model], opacity=0.4, size=5),
-                name="Dataset samples",
-            ))
-            # Perfect prediction line
-            rng = [min(y_true.min(), y_pred_scatter.min()),
-                   max(y_true.max(), y_pred_scatter.max())]
-            fig.add_trace(go.Scatter(
-                x=rng, y=rng, mode="lines",
-                line=dict(color="gray", dash="dash"), name="Perfect prediction",
-            ))
-            # Highlight current input's prediction (no true label available)
-            fig.add_trace(go.Scatter(
-                x=[current_pred], y=[current_pred], mode="markers",
-                marker=dict(color="red", size=14, symbol="star"),
-                name=f"Your input ({current_pred:.1f})",
-            ))
-            fig.update_layout(
-                xaxis_title="True RUL (cycles)",
-                yaxis_title="Predicted RUL (cycles)",
-                height=420,
-                margin=dict(t=20, b=20),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-else:
-    with col_metrics:
-        st.info("Adjust features in the sidebar and click **Predict RUL**.")
-    with col_scatter:
-        if df is not None:
-            st.subheader("Dataset RUL Distribution")
-            fig = go.Figure(go.Histogram(x=df["RUL"], nbinsx=60,
-                                         marker_color="#4C9BE8", opacity=0.8))
-            fig.update_layout(xaxis_title="RUL (cycles)", yaxis_title="Count",
-                               height=380, margin=dict(t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+# ── Input window table ────────────────────────────────────────────────────────
+st.subheader("Input Window — Feature Values")
+display_df = window_df[FEATURE_COLS].copy()
+display_df.index = [f"Cycle {start + i}" for i in range(WINDOW_SIZE)]
+st.dataframe(
+    display_df.style.background_gradient(axis=0, cmap="RdYlGn"),
+    use_container_width=True,
+)
