@@ -23,16 +23,69 @@ FEATURE_COLS = [
     "Charging time (s)",
 ]
 
-CKPT_CNN  = "checkpoints/checkpoint_cnn_rul.pt"
-CKPT_XGB  = "checkpoints/xgboost_baseline_best.joblib"
-CKPT_TFT  = "checkpoints/tft_nasa_weight_2p0_checkpoint.pt"
+CKPT_CNN = "checkpoints/checkpoint_cnn_rul.pt"
+CKPT_XGB = "checkpoints/checkpoint_xgboost_cross_standard.joblib"
+CKPT_TFT = "checkpoints/tft_nasa_weight_2p0_checkpoint.pt"
 
+# Demo batteries are the ones excluded from all training/val/test splits in tft.ipynb
+# (segment_ids 1 and 40, picked with seed 42). Using these ensures fair evaluation.
 DATASETS = {
-    "HNEI": ("HNEI_STANDARD_SCALED.csv", 0),
-    "NASA": ("NASA_STANDARD_SCALED.csv", 1),
+    "HNEI": ("HNEI_TFT_SCALED.csv", 0),
+    "NASA": ("NASA_TFT_SCALED.csv", 1),
 }
 
 WINDOW_SIZE = 10  # cycles passed to each model
+
+# ── Scaling constants ─────────────────────────────────────────────────────────
+# combined_scaled_battery_data.csv stats (used by CNN/TFT — display unscaling)
+_MEANS = {
+    "HNEI": np.array([1584.997, 470.916,   3.904, 3.581,  2963.343, 3811.899,  8299.621]),
+    "NASA": np.array([3225.380, 820.715,   4.152, 3.336,  8854.451, 1793.840, 10427.877]),
+}
+_STDS = {
+    "HNEI": np.array([1111.032, 302.688,   0.083, 0.119,  1244.820, 1576.372, 1078.826]),
+    "NASA": np.array([1385.771, 639.193,   0.357, 0.452,  1768.100, 1064.731, 1039.556]),
+}
+
+# XGBoost-specific scaler stats (StandardScaler fit on training batteries only,
+# with 1st–99th percentile clipping — reproduced from xgboost_cross.py with seed 42)
+_XGB_MEANS = {
+    "HNEI": np.array([3706.960902,  475.815189,    3.905020,    3.577858,
+                      3531.167047, 4571.447794, 9038.368170]),
+    "NASA": np.array([3233.128842,  805.012754,    4.167581,    3.319760,
+                      8834.630621, 1806.651505, 10455.114178]),
+}
+_XGB_STDS = {
+    "HNEI": np.array([19568.378821,  195.665861,    0.083549,    0.118819,
+                       5283.927426, 6906.258161,  6366.051059]),
+    "NASA": np.array([ 1335.023931,  642.048276,    0.165694,    0.456822,
+                       1810.528347, 1064.012524,   916.599969]),
+}
+_XGB_LOWER = {
+    "HNEI": np.array([  838.934400,  192.333333,    3.748000,    3.313960,
+                        964.940094, 1520.558800, 7031.225600]),
+    "NASA": np.array([  586.719000,    0.000000,    2.571725,    0.338425,
+                          7.907980,    0.000000, 3962.583420]),
+}
+_XGB_UPPER = {
+    "HNEI": np.array([187300.791000, 1295.323035,    4.238010,    3.933010,
+                       52114.484160, 66707.294300, 66887.683500]),
+    "NASA": np.array([  6533.499660, 2908.261700,    4.207383,    4.143350,
+                       10803.216640, 3514.551840, 10817.635560]),
+}
+
+def unscale_window(scaled_df, dataset_name):
+    """Return a copy with FEATURE_COLS converted back to physical units for display."""
+    means, stds = _MEANS[dataset_name], _STDS[dataset_name]
+    out = scaled_df.copy()
+    out[FEATURE_COLS] = np.clip(scaled_df[FEATURE_COLS].values * stds + means, 0, None)
+    return out
+
+def rescale_for_xgb(last_row_np, dataset_name):
+    """Convert one row from combined_scaled space to XGBoost-scaler space."""
+    raw     = last_row_np * _STDS[dataset_name] + _MEANS[dataset_name]
+    clipped = np.clip(raw, _XGB_LOWER[dataset_name], _XGB_UPPER[dataset_name])
+    return (clipped - _XGB_MEANS[dataset_name]) / _XGB_STDS[dataset_name]
 
 # ── Model definitions ─────────────────────────────────────────────────────────
 
@@ -88,10 +141,10 @@ class _GRN(nn.Module):
         self.gate = nn.Linear(dim, dim)
         self.norm = nn.LayerNorm(dim)
     def forward(self, x):
-        h = F.elu(self.fc1(x))
-        h = self.fc2(h)
-        g = torch.sigmoid(self.gate(x))
-        return self.norm(g * h + (1 - g) * x)
+        residual = x
+        h = self.fc2(F.elu(self.fc1(x)))       # fc1 → elu → fc2
+        gated = torch.sigmoid(self.gate(h)) * h # gate on fc2 output
+        return self.norm(residual + gated)       # residual + gated (matches GatedResidualNetwork)
 
 class _GatedAddNorm(nn.Module):
     def __init__(self, dim=64):
@@ -106,9 +159,9 @@ class _TemporalFusion(nn.Module):
     def __init__(self, dim=64, n_heads=4):
         super().__init__()
         self.input_grn                = _GRN(dim)
-        self.lstm                     = nn.LSTM(dim, dim, batch_first=False)
+        self.lstm                     = nn.LSTM(dim, dim, batch_first=True)
         self.post_lstm_gate_norm      = _GatedAddNorm(dim)
-        self.attention                = nn.MultiheadAttention(dim, n_heads, batch_first=False)
+        self.attention                = nn.MultiheadAttention(dim, n_heads, batch_first=True)
         self.post_attention_gate_norm = _GatedAddNorm(dim)
         self.positionwise_grn         = _GRN(dim)
 
@@ -130,17 +183,18 @@ class TFTHybrid(nn.Module):
     def forward(self, x, is_nasa):
         for blk in self.conv_feature_extractor:
             x = blk(x)                                           # (B, 64, W)
-        x = x.permute(2, 0, 1)                                  # (W, B, 64)
+        x = x.transpose(1, 2)                                   # (B, W, 64) — batch_first
 
         tf = self.temporal_fusion
-        x_grn = tf.input_grn(x)                                 # (W, B, 64)
-        lstm_out, _ = tf.lstm(x_grn)                            # (W, B, 64)
-        x_lstm = tf.post_lstm_gate_norm(lstm_out, x_grn)        # (W, B, 64)
-        attn_out, _ = tf.attention(x_lstm, x_lstm, x_lstm)      # (W, B, 64)
-        x_attn = tf.post_attention_gate_norm(attn_out, x_lstm)  # (W, B, 64)
-        x_out  = tf.positionwise_grn(x_attn)                    # (W, B, 64)
+        x_grn = tf.input_grn(x)                                 # (B, W, 64)
+        lstm_out, _ = tf.lstm(x_grn)                            # (B, W, 64)
+        x_lstm = tf.post_lstm_gate_norm(lstm_out, x_grn)        # (B, W, 64)
+        attn_out, _ = tf.attention(x_lstm, x_lstm, x_lstm,
+                                   need_weights=False)           # (B, W, 64)
+        x_attn = tf.post_attention_gate_norm(attn_out, x_lstm)  # (B, W, 64)
+        x_out  = tf.positionwise_grn(x_attn)                    # (B, W, 64)
 
-        h = x_out[-1]                                           # (B, 64) last step
+        h = x_out[:, -1, :]                                     # (B, 64) last time step
         s = self.static_branch(is_nasa.view(-1, 1))             # (B, 8)
         return self.regression_head(torch.cat([h, s], dim=1))   # (B, 1)
 
@@ -165,6 +219,17 @@ def load_tft():
     model.eval()
     return model
 
+# Option 2 — pytorch_forecasting loader (use with demo_tft_transformer_balanced.ckpt):
+# @st.cache_resource
+# def load_tft():
+#     from pytorch_forecasting import TemporalFusionTransformer
+#     import warnings
+#     with warnings.catch_warnings():
+#         warnings.simplefilter("ignore")
+#         model = TemporalFusionTransformer.load_from_checkpoint(CKPT_TFT, map_location="cpu")
+#     model.eval()
+#     return model
+
 @st.cache_data
 def load_dataset(name):
     path, _ = DATASETS[name]
@@ -179,21 +244,39 @@ def predict_cnn(model, window_np, is_nasa_val):
     with torch.no_grad():
         return max(0.0, model(x, isn).item())
 
-def predict_xgb(bundle, last_row_np):
-    """last_row_np: (7,) — XGBoost is a per-cycle model, use last cycle of window."""
-    X = last_row_np.reshape(1, -1).astype(np.float32)
-    # Replace any NaN with column median as fallback (imputer has sklearn version mismatch)
-    col_medians = np.nanmedian(X, axis=0)
-    nan_mask = np.isnan(X)
-    X[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
-    return max(0.0, float(bundle["model"].predict(X)[0]))
+def predict_xgb(bundle, last_row_np, is_nasa_val, dataset_name):
+    """last_row_np: (7,) in combined_scaled space — converts to XGB-scaler space first."""
+    model = bundle["model"] if isinstance(bundle, dict) else bundle
+    xgb_row = rescale_for_xgb(last_row_np, dataset_name).astype(np.float32)
+    X = xgb_row.reshape(1, -1)
+    if model.n_features_in_ == 8:
+        X = np.hstack([X, np.array([[is_nasa_val]], dtype=np.float32)])
+    return max(0.0, float(model.predict(X)[0]))
 
 def predict_tft(model, window_np, is_nasa_val):
-    """window_np: (WINDOW_SIZE, 7)"""
+    """window_np: (WINDOW_SIZE, 7) in combined_scaled space."""
     x   = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
     isn = torch.tensor([[is_nasa_val]], dtype=torch.float32)
     with torch.no_grad():
         return max(0.0, model(x, isn).item())
+
+# Option 2 — pytorch_forecasting TFT inference (use with demo_tft_transformer_balanced.ckpt):
+# def predict_tft(model, window_df, is_nasa_val):
+#     from pytorch_forecasting import TimeSeriesDataSet
+#     TFT_RENAME = {"Discharge Time (s)":"discharge_time","Decrement 3.6-3.4V (s)":"decrement_36_34",
+#                   "Max. Voltage Dischar. (V)":"max_voltage_discharge","Min. Voltage Charg. (V)":"min_voltage_charge",
+#                   "Time at 4.15V (s)":"time_at_415","Time constant current (s)":"time_constant_current","Charging time (s)":"charging_time"}
+#     df = window_df[FEATURE_COLS+["RUL"]].copy().rename(columns={**TFT_RENAME,"RUL":"target"})
+#     df["battery_id"]="demo"; df["time_idx"]=list(range(len(df))); df["Is_NASA"]=float(is_nasa_val); df["target"]=df["target"].astype(float)
+#     try:
+#         dataset = TimeSeriesDataSet(df,time_idx="time_idx",target="target",group_ids=["battery_id"],
+#             min_encoder_length=1,max_encoder_length=len(df),min_prediction_length=1,max_prediction_length=1,
+#             static_reals=["Is_NASA"],time_varying_known_reals=["time_idx"],
+#             time_varying_unknown_reals=list(TFT_RENAME.values()),add_relative_time_idx=True,add_encoder_length=True,predict_mode=True)
+#         dl = dataset.to_dataloader(batch_size=1,shuffle=False,num_workers=0)
+#         return max(0.0, model.predict(dl,return_index=False).squeeze().item())
+#     except Exception as e:
+#         return None, str(e)
 
 # ── Page setup ────────────────────────────────────────────────────────────────
 
@@ -266,7 +349,7 @@ if run_cnn:
     results["CNN"] = predict_cnn(cnn_model, window_np, is_nasa)
 
 if run_xgb:
-    results["XGBoost"] = predict_xgb(xgb_bundle, window_np[-1])
+    results["XGBoost"] = predict_xgb(xgb_bundle, window_np[-1], is_nasa, dataset_name)
 
 if run_tft:
     results["TFT"] = predict_tft(tft_model, window_np, is_nasa)
@@ -311,8 +394,8 @@ if results:
     st.plotly_chart(fig, use_container_width=True)
 
 # ── Input window table ────────────────────────────────────────────────────────
-st.subheader("Input Window — Feature Values")
-display_df = window_df[FEATURE_COLS].copy()
+st.subheader("Input Window — Feature Values (Physical Units)")
+display_df = unscale_window(window_df[FEATURE_COLS], dataset_name)
 display_df.index = [f"Cycle {start + i}" for i in range(WINDOW_SIZE)]
 st.dataframe(
     display_df.style.background_gradient(axis=0, cmap="RdYlGn"),
