@@ -454,11 +454,12 @@ def main():
               f"CNN R²={r2_baseline:.4f}  Transfer R²={r2_transfer:.4f}  gap={r2_gap:.4f}")
 
         if r2_gap > best_r2_gap:
-            best_r2_gap       = r2_gap
-            best_battery_seg  = battery_seg
-            best_baseline_rul = seg_baseline
-            best_transfer_rul = seg_transfer
-            best_true_rul     = seg_true
+            best_r2_gap        = r2_gap
+            best_battery_seg   = battery_seg
+            best_battery_scaled = seg_scaled[0]
+            best_baseline_rul  = seg_baseline
+            best_transfer_rul  = seg_transfer
+            best_true_rul      = seg_true
 
     print(f"\nBest battery: {len(best_battery_seg)} cycles, R² gap = {best_r2_gap:.4f}")
 
@@ -469,6 +470,11 @@ def main():
     })
     csv_df.to_csv("best_demo_battery.csv", index=False)
     print("Saved to best_demo_battery.csv")
+
+    feature_df = best_battery_scaled[FEATURE_COLS + ["RUL"]].copy()
+    feature_df.insert(0, "cycle", np.arange(1, len(feature_df) + 1))
+    feature_df.to_csv("best_demo_battery_features.csv", index=False)
+    print("Saved scaled features to best_demo_battery_features.csv")
 
     # -----------------------------------------------------------------------
     # Plot
