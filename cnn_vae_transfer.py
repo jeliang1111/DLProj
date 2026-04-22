@@ -12,9 +12,9 @@ from sklearn.preprocessing import MinMaxScaler
 # Config
 # ---------------------------------------------------------------------------
 HNEI_DATA_PATH = "Battery_RUL_Cleaned.csv"
-NASA_DATA_PATH = "nasa_battery_cycles.csv"
-HNEI_WINDOW_SIZE = 15
-NASA_WINDOW_SIZE = 15
+NEW_DATA_PATH  = "features.csv"
+HNEI_WINDOW_SIZE = 10
+NEW_WINDOW_SIZE  = 10
 BATCH_SIZE  = 256
 LATENT_DIM  = 32
 LR          = 1e-3
@@ -25,9 +25,9 @@ BASELINE_EPOCHS = 50
 
 NUM_FINETUNE_BATTERIES = 1
 
-# Set to "HNEI" to train on HNEI and transfer to NASA,
-# or "NASA" to train on NASA and transfer to HNEI.
-SOURCE_DOMAIN = "NASA"
+# Set to "HNEI" to train on HNEI and transfer to New,
+# or "New" to train on New and transfer to HNEI.
+SOURCE_DOMAIN = "New"
 
 CKPT_VAE       = f"checkpoint_vae_{SOURCE_DOMAIN}.pt"
 CKPT_TRANSFER  = f"checkpoint_transfer_{SOURCE_DOMAIN}.pt"
@@ -382,40 +382,40 @@ def main():
     print(f"Using device: {device}\n")
 
     # --- segment data by battery ---
-    hnei_df = pd.read_csv(HNEI_DATA_PATH)
-    nasa_df = pd.read_csv(NASA_DATA_PATH)
-    hnei_df["Is_NASA"] = 0
-    nasa_df["Is_NASA"] = 1
+    hnei_df = pd.read_csv(HNEI_DATA_PATH).dropna(subset=FEATURE_COLS)
+    new_df  = pd.read_csv(NEW_DATA_PATH).dropna(subset=FEATURE_COLS)
+    hnei_df["Is_New"] = 0
+    new_df["Is_New"]  = 1
     hnei_segments = split_into_battery_segments(hnei_df)
-    nasa_segments = split_into_battery_segments(nasa_df)
-    print(f"Total — HNEI: {len(hnei_segments)} batteries, NASA: {len(nasa_segments)} batteries")
+    new_segments  = split_into_battery_segments(new_df)
+    print(f"Total — HNEI: {len(hnei_segments)} batteries, New: {len(new_segments)} batteries")
 
     # --- reserve one battery from each domain for demo only ---
     rng = np.random.default_rng(42)
     demo_hnei = hnei_segments[rng.integers(len(hnei_segments))]
-    demo_nasa = nasa_segments[rng.integers(len(nasa_segments))]
+    demo_new  = new_segments[rng.integers(len(new_segments))]
     hnei_segments = [s for s in hnei_segments if not s.equals(demo_hnei)]
-    nasa_segments = [s for s in nasa_segments if not s.equals(demo_nasa)]
-    print(f"Demo batteries reserved — HNEI: 1, NASA: 1")
+    new_segments  = [s for s in new_segments  if not s.equals(demo_new)]
+    print(f"Demo batteries reserved — HNEI: 1, New: 1")
 
     # save demo battery windows so the Streamlit app can load them directly
     demo_hnei_windows, demo_hnei_labels = build_sliding_windows([demo_hnei], HNEI_WINDOW_SIZE)
-    demo_nasa_windows, demo_nasa_labels = build_sliding_windows([demo_nasa], NASA_WINDOW_SIZE)
+    demo_new_windows,  demo_new_labels  = build_sliding_windows([demo_new],  NEW_WINDOW_SIZE)
     np.savez(
         DEMO_DATA_PATH,
         hnei_windows=demo_hnei_windows, hnei_labels=demo_hnei_labels,
-        nasa_windows=demo_nasa_windows, nasa_labels=demo_nasa_labels,
+        new_windows=demo_new_windows,   new_labels=demo_new_labels,
     )
     print(f"Demo data saved to {DEMO_DATA_PATH}\n")
 
     # --- assign source / target domains based on SOURCE_DOMAIN setting ---
     if SOURCE_DOMAIN == "HNEI":
-        source_segments, target_segments = hnei_segments, nasa_segments
+        source_segments, target_segments = hnei_segments, new_segments
     else:
-        source_segments, target_segments = nasa_segments, hnei_segments
-    target_name        = "NASA" if SOURCE_DOMAIN == "HNEI" else "HNEI"
-    source_window_size = HNEI_WINDOW_SIZE if SOURCE_DOMAIN == "HNEI" else NASA_WINDOW_SIZE
-    target_window_size = NASA_WINDOW_SIZE if SOURCE_DOMAIN == "HNEI" else HNEI_WINDOW_SIZE
+        source_segments, target_segments = new_segments, hnei_segments
+    target_name        = "New"  if SOURCE_DOMAIN == "HNEI" else "HNEI"
+    source_window_size = HNEI_WINDOW_SIZE if SOURCE_DOMAIN == "HNEI" else NEW_WINDOW_SIZE
+    target_window_size = NEW_WINDOW_SIZE  if SOURCE_DOMAIN == "HNEI" else HNEI_WINDOW_SIZE
     print(f"Transfer direction: {SOURCE_DOMAIN} → {target_name}")
     print(f"Window sizes — source: {source_window_size}, target: {target_window_size}")
 
@@ -480,7 +480,7 @@ def main():
         return s
 
     demo_hnei = scale_single(demo_hnei)
-    demo_nasa = scale_single(demo_nasa)
+    demo_new  = scale_single(demo_new)
 
     # --- build window arrays ---
     X_source,      y_source      = build_sliding_windows(source_train_segs, source_window_size)
@@ -618,7 +618,7 @@ def main():
     # HNEI demo → source_scaler; NASA demo → target_scaler (or reversed when SOURCE_DOMAIN="NASA").
     demo_configs = [
         (demo_hnei, "Demo HNEI Battery", source_scaler if SOURCE_DOMAIN == "HNEI" else target_scaler, HNEI_WINDOW_SIZE),
-        (demo_nasa, "Demo NASA Battery", target_scaler if SOURCE_DOMAIN == "HNEI" else source_scaler, NASA_WINDOW_SIZE),
+        (demo_new,  "Demo New Battery",  target_scaler if SOURCE_DOMAIN == "HNEI" else source_scaler, NEW_WINDOW_SIZE),
     ]
 
     _, demo_axes = plt.subplots(1, 2, figsize=(14, 5))

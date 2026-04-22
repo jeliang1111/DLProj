@@ -12,9 +12,9 @@ from sklearn.preprocessing import MinMaxScaler
 # Config
 # ---------------------------------------------------------------------------
 HNEI_DATA_PATH = "Battery_RUL_Cleaned.csv"
-NASA_DATA_PATH = "nasa_battery_cycles.csv"
+NEW_DATA_PATH  = "features.csv"
 
-WINDOW_SIZE = 10
+WINDOW_SIZE = 30
 BATCH_SIZE  = 256
 LATENT_DIM  = 32
 LR          = 1e-3
@@ -24,9 +24,9 @@ FINETUNE_EPOCHS       = 100
 BASELINE_EPOCHS       = 100
 NUM_TRAIN_BATTERIES   = 10
 
-CKPT_VAE      = "ckpt_nasa_fewshot_vae.pt"
-CKPT_TRANSFER = "ckpt_nasa_fewshot_transfer.pt"
-CKPT_BASELINE = "ckpt_nasa_fewshot_baseline.pt"
+CKPT_VAE      = "ckpt_new_fewshot_vae.pt"
+CKPT_TRANSFER = "ckpt_new_fewshot_transfer.pt"
+CKPT_BASELINE = "ckpt_new_fewshot_baseline.pt"
 
 FEATURE_COLS = [
     "Discharge Time (s)",
@@ -302,46 +302,43 @@ def main():
 
     # --- load data ---
     hnei_df = pd.read_csv(HNEI_DATA_PATH)
-    nasa_df = pd.read_csv(NASA_DATA_PATH)
-    hnei_df["Is_NASA"] = 0
-    nasa_df["Is_NASA"] = 1
+    new_df  = pd.read_csv(NEW_DATA_PATH).dropna(subset=FEATURE_COLS)
+    hnei_df["Is_New"] = 0
+    new_df["Is_New"]  = 1
     hnei_segments = split_into_battery_segments(hnei_df)
-    nasa_segments = split_into_battery_segments(nasa_df)
-    print(f"HNEI: {len(hnei_segments)} batteries, NASA: {len(nasa_segments)} batteries")
+    new_segments  = split_into_battery_segments(new_df)
+    print(f"HNEI: {len(hnei_segments)} batteries, New: {len(new_segments)} batteries")
 
-    # --- randomly pick NASA batteries for training ---
+    # --- randomly pick New batteries for training ---
     rng = np.random.default_rng(42)
-    train_indices      = set(rng.choice(len(nasa_segments), size=NUM_TRAIN_BATTERIES, replace=False).tolist())
-    nasa_train_battery = [s for i, s in enumerate(nasa_segments) if i in train_indices]
-    nasa_test_segs     = [s for i, s in enumerate(nasa_segments) if i not in train_indices]
-    print(f"NASA train batteries: {NUM_TRAIN_BATTERIES} "
-          f"(cycles: {[len(s) for s in nasa_train_battery]})")
-    print(f"NASA test batteries: {len(nasa_test_segs)}\n")
+    train_indices     = set(rng.choice(len(new_segments), size=NUM_TRAIN_BATTERIES, replace=False).tolist())
+    new_train_battery = [s for i, s in enumerate(new_segments) if i in train_indices]
+    new_test_segs     = [s for i, s in enumerate(new_segments) if i not in train_indices]
+    print(f"New train batteries: {NUM_TRAIN_BATTERIES} "
+          f"(cycles: {[len(s) for s in new_train_battery]})")
+    print(f"New test batteries: {len(new_test_segs)}\n")
 
-    # Each domain uses its own feature scaler so neither domain's data is distorted
-    # by the other's statistics. HNEI scaler fit on all HNEI; NASA scaler fit on the
-    # 1 training battery (the only NASA data we are allowed to use at training time).
     hnei_scaler, hnei_lower, hnei_upper = fit_scaler(hnei_segments)
-    nasa_scaler, nasa_lower, nasa_upper = fit_scaler(nasa_train_battery)
+    new_scaler,  new_lower,  new_upper  = fit_scaler(new_train_battery)
 
-    hnei_scaled       = scale_segments(hnei_segments,     hnei_scaler, hnei_lower, hnei_upper)
-    nasa_train_scaled = scale_segments(nasa_train_battery, nasa_scaler, nasa_lower, nasa_upper)
-    nasa_test_scaled  = scale_segments(nasa_test_segs,    nasa_scaler, nasa_lower, nasa_upper)
+    hnei_scaled      = scale_segments(hnei_segments,    hnei_scaler, hnei_lower, hnei_upper)
+    new_train_scaled = scale_segments(new_train_battery, new_scaler,  new_lower,  new_upper)
+    new_test_scaled  = scale_segments(new_test_segs,    new_scaler,  new_lower,  new_upper)
 
     # --- build windows ---
-    X_nasa_train, y_nasa_train = build_sliding_windows(nasa_train_scaled, WINDOW_SIZE)
-    X_nasa_test,  y_nasa_test  = build_sliding_windows(nasa_test_scaled,  WINDOW_SIZE)
-    X_hnei,       y_hnei       = build_sliding_windows(hnei_scaled,       WINDOW_SIZE)
-    print(f"Windows — NASA train: {len(X_nasa_train)}, NASA test: {len(X_nasa_test)}, HNEI: {len(X_hnei)}")
+    X_new_train, y_new_train = build_sliding_windows(new_train_scaled, WINDOW_SIZE)
+    X_new_test,  y_new_test  = build_sliding_windows(new_test_scaled,  WINDOW_SIZE)
+    X_hnei,      y_hnei      = build_sliding_windows(hnei_scaled,      WINDOW_SIZE)
+    print(f"Windows — New train: {len(X_new_train)}, New test: {len(X_new_test)}, HNEI: {len(X_hnei)}")
 
-    nasa_rul_scaler = RULScaler().fit(y_nasa_train)
+    new_rul_scaler  = RULScaler().fit(y_new_train)
     hnei_rul_scaler = RULScaler().fit(y_hnei)
-    print(f"NASA train RUL range: {nasa_rul_scaler.rul_min:.0f} – {nasa_rul_scaler.rul_max:.0f}")
+    print(f"New train RUL range: {new_rul_scaler.rul_min:.0f} – {new_rul_scaler.rul_max:.0f}")
     print(f"HNEI RUL range: {hnei_rul_scaler.rul_min:.0f} – {hnei_rul_scaler.rul_max:.0f}\n")
 
-    nasa_train_loader = make_loader(X_nasa_train, nasa_rul_scaler.transform(y_nasa_train), shuffle=True)
-    nasa_test_loader  = make_loader(X_nasa_test,  nasa_rul_scaler.transform(y_nasa_test),  shuffle=False)
-    hnei_loader       = make_loader(X_hnei,        hnei_rul_scaler.transform(y_hnei),       shuffle=True)
+    new_train_loader = make_loader(X_new_train, new_rul_scaler.transform(y_new_train), shuffle=True)
+    new_test_loader  = make_loader(X_new_test,  new_rul_scaler.transform(y_new_test),  shuffle=False)
+    hnei_loader      = make_loader(X_hnei,      hnei_rul_scaler.transform(y_hnei),     shuffle=True)
     mse = nn.MSELoss()
 
     # -----------------------------------------------------------------------
@@ -363,10 +360,10 @@ def main():
     load_or_train(vae, CKPT_VAE, train_vae)
 
     # -----------------------------------------------------------------------
-    # Phase 2: Fine-tune regression head on 1 NASA battery
+    # Phase 2: Fine-tune regression head on New batteries
     # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print(f"Phase 2: Fine-tuning on {NUM_TRAIN_BATTERIES} NASA batteries (HNEI VAE → NASA)")
+    print(f"Phase 2: Fine-tuning on {NUM_TRAIN_BATTERIES} New batteries (HNEI VAE → New)")
     print("=" * 60)
 
     transfer_model = TransferRULNet(vae.encoder, vae.fc_mu, LATENT_DIM).to(device)
@@ -376,17 +373,17 @@ def main():
 
     def train_transfer():
         for epoch in range(1, FINETUNE_EPOCHS + 1):
-            loss = train_regression_epoch(transfer_model, nasa_train_loader, mse, ft_optim, device)
+            loss = train_regression_epoch(transfer_model, new_train_loader, mse, ft_optim, device)
             if epoch % 10 == 0 or epoch == 1:
                 print(f"  epoch {epoch:3d}/{FINETUNE_EPOCHS}  loss={loss:.4f}")
 
     load_or_train(transfer_model, CKPT_TRANSFER, train_transfer)
 
     # -----------------------------------------------------------------------
-    # Baseline: CNN trained from scratch on the same 1 NASA battery only
+    # Baseline: CNN trained from scratch on the same New batteries only
     # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print(f"Baseline: CNN trained from scratch on {NUM_TRAIN_BATTERIES} NASA batteries only")
+    print(f"Baseline: CNN trained from scratch on {NUM_TRAIN_BATTERIES} New batteries only")
     print("=" * 60)
 
     baseline_model     = FewShotCNN(NUM_FEATURES).to(device)
@@ -395,7 +392,7 @@ def main():
 
     def train_baseline():
         for epoch in range(1, BASELINE_EPOCHS + 1):
-            loss = train_regression_epoch(baseline_model, nasa_train_loader, mse, baseline_optim, device)
+            loss = train_regression_epoch(baseline_model, new_train_loader, mse, baseline_optim, device)
             baseline_scheduler.step()
             if epoch % 10 == 0 or epoch == 1:
                 print(f"  epoch {epoch:3d}/{BASELINE_EPOCHS}  loss={loss:.4f}")
@@ -403,31 +400,31 @@ def main():
     load_or_train(baseline_model, CKPT_BASELINE, train_baseline)
 
     # -----------------------------------------------------------------------
-    # Evaluation on held-out NASA test batteries
+    # Evaluation on held-out New test batteries
     # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("Results on held-out NASA test batteries")
+    print("Results on held-out New test batteries")
     print("=" * 60)
 
-    baseline_norm, labels_norm = predict(baseline_model, nasa_test_loader, device)
-    transfer_norm, _           = predict(transfer_model,  nasa_test_loader, device)
+    baseline_norm, labels_norm = predict(baseline_model, new_test_loader, device)
+    transfer_norm, _           = predict(transfer_model,  new_test_loader, device)
 
-    baseline_preds = nasa_rul_scaler.inverse_transform(baseline_norm)
-    transfer_preds = nasa_rul_scaler.inverse_transform(transfer_norm)
-    true_labels    = nasa_rul_scaler.inverse_transform(labels_norm)
+    baseline_preds = new_rul_scaler.inverse_transform(baseline_norm)
+    transfer_preds = new_rul_scaler.inverse_transform(transfer_norm)
+    true_labels    = new_rul_scaler.inverse_transform(labels_norm)
 
-    print_metrics(f"CNN ({NUM_TRAIN_BATTERIES} NASA batteries, no transfer)", baseline_preds, true_labels)
-    print_metrics(f"VAE Transfer (HNEI → {NUM_TRAIN_BATTERIES} NASA fine-tune)", transfer_preds, true_labels)
+    print_metrics(f"CNN ({NUM_TRAIN_BATTERIES} New batteries, no transfer)", baseline_preds, true_labels)
+    print_metrics(f"VAE Transfer (HNEI → {NUM_TRAIN_BATTERIES} New fine-tune)", transfer_preds, true_labels)
 
     # -----------------------------------------------------------------------
     # Plot
     # -----------------------------------------------------------------------
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f"Few-shot comparison: {NUM_TRAIN_BATTERIES} NASA training batteries", fontsize=13)
+    fig.suptitle(f"Few-shot comparison: {NUM_TRAIN_BATTERIES} New training batteries", fontsize=13)
 
     for ax, (preds, title) in zip(axes, [
-        (baseline_preds, f"CNN from scratch\n({NUM_TRAIN_BATTERIES} NASA batteries only)"),
-        (transfer_preds, f"VAE Transfer\n(HNEI pre-trained → {NUM_TRAIN_BATTERIES} NASA fine-tune)"),
+        (baseline_preds, f"CNN from scratch\n({NUM_TRAIN_BATTERIES} New batteries only)"),
+        (transfer_preds, f"VAE Transfer\n(HNEI pre-trained → {NUM_TRAIN_BATTERIES} New fine-tune)"),
     ]):
         ax.scatter(true_labels, preds, alpha=0.3, s=10)
         lo, hi = true_labels.min(), true_labels.max()
@@ -438,9 +435,9 @@ def main():
         ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig("nasa_few_shot_comparison.png", dpi=150)
+    plt.savefig("new_few_shot_comparison.png", dpi=150)
     plt.show()
-    print("\nPlot saved to nasa_few_shot_comparison.png")
+    print("\nPlot saved to new_few_shot_comparison.png")
 
 
 if __name__ == "__main__":

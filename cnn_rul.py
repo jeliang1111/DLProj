@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,14 +6,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_PATH         = "combined_scaled_battery_data.csv"
+CALCE_DATA_PATH   = "Battery_RUL_Cleaned.csv"
+NEW_DATA_PATH     = "features.csv"
 CKPT_PATH         = "checkpoint_cnn_rul.pt"
 WINDOW_SIZE       = 10
-NUM_TEST_BATTERIES = 8
+NUM_TEST_CALCE    = 4
+NUM_TEST_NEW      = 4
 BATCH_SIZE        = 256
 NUM_EPOCHS        = 50
 LR                = 1e-3
@@ -27,43 +31,59 @@ FEATURE_COLS = [
     "Charging time (s)",
 ]
 
+
 # ---------------------------------------------------------------------------
-# Data preparation
+# Data utilities
 # ---------------------------------------------------------------------------
 
 def split_into_battery_segments(dataframe: pd.DataFrame) -> list[pd.DataFrame]:
-    """Split dataframe into per-battery segments by detecting RUL resets."""
-    rul_values = dataframe["RUL"].values
-    rul_diffs = np.diff(rul_values)
-    boundary_indices = np.where(rul_diffs > 0)[0] + 1
+    diffs      = np.diff(dataframe["RUL"].values)
+    boundaries = np.where(diffs > 0)[0] + 1
+    starts     = np.concatenate([[0], boundaries])
+    ends       = np.concatenate([boundaries, [len(dataframe)]])
+    return [dataframe.iloc[s:e].reset_index(drop=True) for s, e in zip(starts, ends)]
 
-    segment_starts = np.concatenate([[0], boundary_indices])
-    segment_ends   = np.concatenate([boundary_indices, [len(dataframe)]])
 
-    return [
-        dataframe.iloc[start:end].reset_index(drop=True)
-        for start, end in zip(segment_starts, segment_ends)
-    ]
+def fit_domain_scaler(
+    train_segs: list[pd.DataFrame],
+) -> tuple[StandardScaler, np.ndarray, np.ndarray]:
+    vals  = pd.concat(train_segs)[FEATURE_COLS].values
+    lower = np.percentile(vals, 1, axis=0)
+    upper = np.percentile(vals, 99, axis=0)
+    scaler = StandardScaler()
+    scaler.fit(np.clip(vals, lower, upper))
+    return scaler, lower, upper
+
+
+def scale_segments(
+    segs: list[pd.DataFrame],
+    scaler: StandardScaler,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> list[pd.DataFrame]:
+    result = []
+    for seg in segs:
+        s = seg.copy()
+        s[FEATURE_COLS] = scaler.transform(np.clip(s[FEATURE_COLS].values, lower, upper))
+        result.append(s)
+    return result
 
 
 def build_sliding_windows(
     segments: list[pd.DataFrame], window_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Create (window, is_nasa_flag, rul_label) triples from each battery segment."""
-    windows    = []
-    nasa_flags = []
-    labels     = []
+    windows, domain_flags, labels = [], [], []
     for seg in segments:
         feature_array = seg[FEATURE_COLS].values.astype(np.float32)
         rul_array     = seg["RUL"].values.astype(np.float32)
-        is_nasa_flag  = float(seg["Is_NASA"].iloc[0])
+        domain_flag   = float(seg["Is_New"].iloc[0])
         for i in range(len(seg) - window_size):
             windows.append(feature_array[i : i + window_size])
-            nasa_flags.append(is_nasa_flag)
+            domain_flags.append(domain_flag)
             labels.append(rul_array[i + window_size - 1])
     return (
         np.array(windows),
-        np.array(nasa_flags, dtype=np.float32),
+        np.array(domain_flags, dtype=np.float32),
         np.array(labels, dtype=np.float32),
     )
 
@@ -73,10 +93,9 @@ def build_sliding_windows(
 # ---------------------------------------------------------------------------
 
 class BatteryWindowDataset(Dataset):
-    def __init__(self, windows: np.ndarray, nasa_flags: np.ndarray, labels: np.ndarray):
-        # Conv1d expects (batch, channels, length), so permute from (N, T, C) -> (N, C, T)
+    def __init__(self, windows: np.ndarray, domain_flags: np.ndarray, labels: np.ndarray):
         self.X_seq    = torch.tensor(windows).permute(0, 2, 1)
-        self.X_static = torch.tensor(nasa_flags).unsqueeze(1)   # (N, 1)
+        self.X_static = torch.tensor(domain_flags).unsqueeze(1)
         self.y        = torch.tensor(labels).unsqueeze(1)
 
     def __len__(self) -> int:
@@ -105,17 +124,12 @@ class RULConvNet(nn.Module):
     """Dual-branch 1D CNN for battery RUL regression.
 
     Branch A (sequential): Conv1D layers over the 7 cycle features.
-    Branch B (static):     Small Dense layer for the Is_NASA flag.
+    Branch B (static):     Small Dense layer for the domain flag (Is_New).
     Both branches are concatenated before the final regression head.
-
-    Inputs:  seq    (batch, num_features, window_size)
-             static (batch, 1)
-    Output:  (batch, 1)
     """
 
     def __init__(self, num_features: int):
         super().__init__()
-        # Branch A: temporal encoder
         self.encoder = nn.Sequential(
             ConvBlock(num_features, 64,  kernel_size=3),
             ConvBlock(64,           128, kernel_size=3),
@@ -123,15 +137,13 @@ class RULConvNet(nn.Module):
             ConvBlock(128,          128, kernel_size=3),
             ConvBlock(128,          64,  kernel_size=3),
         )
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)   # → (batch, 64, 1)
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
 
-        # Branch B: static source encoder
         self.static_encoder = nn.Sequential(
             nn.Linear(1, 8),
             nn.ReLU(),
         )
 
-        # Regression head: 64 (CNN) + 8 (static) = 72
         self.regressor = nn.Sequential(
             nn.Linear(64 + 8, 64),
             nn.ReLU(),
@@ -140,24 +152,17 @@ class RULConvNet(nn.Module):
         )
 
     def forward(self, seq: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
-        temporal_features = self.global_avg_pool(self.encoder(seq))  # (batch, 64, 1)
-        temporal_features = temporal_features.squeeze(-1)             # (batch, 64)
-        static_features   = self.static_encoder(static)               # (batch, 8)
-        combined          = torch.cat([temporal_features, static_features], dim=1)  # (batch, 72)
+        temporal_features = self.global_avg_pool(self.encoder(seq)).squeeze(-1)
+        static_features   = self.static_encoder(static)
+        combined          = torch.cat([temporal_features, static_features], dim=1)
         return self.regressor(combined)
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training / evaluation
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> float:
+def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     model.train()
     total_loss = 0.0
     for batch_seq, batch_static, batch_y in loader:
@@ -172,17 +177,9 @@ def train_one_epoch(
     return total_loss / len(loader.dataset)
 
 
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss  = 0.0
-    all_preds   = []
-    all_labels  = []
-    all_is_nasa = []
+    total_loss, all_preds, all_labels, all_flags = 0.0, [], [], []
     with torch.no_grad():
         for batch_seq, batch_static, batch_y in loader:
             batch_seq, batch_static, batch_y = (
@@ -192,13 +189,12 @@ def evaluate(
             total_loss += criterion(preds, batch_y).item() * len(batch_y)
             all_preds.append(preds.cpu().numpy())
             all_labels.append(batch_y.cpu().numpy())
-            all_is_nasa.append(batch_static.cpu().numpy())
-    avg_loss = total_loss / len(loader.dataset)
+            all_flags.append(batch_static.cpu().numpy())
     return (
-        avg_loss,
+        total_loss / len(loader.dataset),
         np.concatenate(all_preds).flatten(),
         np.concatenate(all_labels).flatten(),
-        np.concatenate(all_is_nasa).flatten(),
+        np.concatenate(all_flags).flatten(),
     )
 
 
@@ -210,65 +206,73 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- load & split ---
-    df = pd.read_csv(DATA_PATH)
-    print(f"Loaded dataset: {df.shape}")
+    # --- load & tag ---
+    calce_df = pd.read_csv(CALCE_DATA_PATH)
+    calce_df["Is_New"] = 0
+    calce_segments = split_into_battery_segments(calce_df)
 
-    battery_segments = split_into_battery_segments(df)
+    new_df = pd.read_csv(NEW_DATA_PATH).dropna(subset=FEATURE_COLS)
+    new_df["Is_New"] = 1
+    new_segments = split_into_battery_segments(new_df)
+    print(f"CALCE: {len(calce_segments)} batteries, New: {len(new_segments)} batteries")
 
     rng = np.random.default_rng(42)
 
-    # --- reserve 1 CALCE + 1 NASA battery for demo, exclude from all training/testing ---
-    all_calce = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 0]
-    all_nasa  = [s for s in battery_segments if s["Is_NASA"].iloc[0] == 1]
-    demo_calce = all_calce[rng.integers(len(all_calce))]
-    demo_nasa  = all_nasa[rng.integers(len(all_nasa))]
-    demo_df = pd.concat([demo_calce, demo_nasa], ignore_index=True)
+    # --- reserve 1 demo battery from each domain ---
+    demo_calce = calce_segments[rng.integers(len(calce_segments))]
+    demo_new   = new_segments[rng.integers(len(new_segments))]
+    demo_df    = pd.concat([demo_calce, demo_new], ignore_index=True)
     demo_df.to_csv("demo_batteries_cnn.csv", index=False)
-    print(f"Demo batteries saved to demo_batteries_cnn.csv "
-          f"(CALCE: {len(demo_calce)} cycles, NASA: {len(demo_nasa)} cycles)")
-    battery_segments = [s for s in battery_segments
-                        if not s.equals(demo_calce) and not s.equals(demo_nasa)]
+    print(f"Demo saved (CALCE: {len(demo_calce)} cycles, New: {len(demo_new)} cycles)")
 
-    # Stratified split: sample test batteries from each source (CALCE + NASA)
-    # to avoid testing entirely on an unseen data distribution.
-    calce_indices = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 0]
-    nasa_indices  = [i for i, s in enumerate(battery_segments) if s["Is_NASA"].iloc[0] == 1]
+    calce_remaining = [s for s in calce_segments if not s.equals(demo_calce)]
+    new_remaining   = [s for s in new_segments   if not s.equals(demo_new)]
 
-    num_test_calce = NUM_TEST_BATTERIES // 2
-    num_test_nasa  = NUM_TEST_BATTERIES - num_test_calce
-    test_indices = list(rng.choice(calce_indices, size=num_test_calce, replace=False)) + \
-                   list(rng.choice(nasa_indices,  size=num_test_nasa,  replace=False))
-    test_index_set = set(test_indices)
-    train_segments = [s for i, s in enumerate(battery_segments) if i not in test_index_set]
-    test_segments  = [battery_segments[i] for i in test_indices]
-    print(f"Batteries — train: {len(train_segments)}, test: {len(test_segments)}")
+    # --- stratified train/test split ---
+    calce_test_idx = set(rng.choice(len(calce_remaining), size=NUM_TEST_CALCE, replace=False).tolist())
+    new_test_idx   = set(rng.choice(len(new_remaining),   size=NUM_TEST_NEW,   replace=False).tolist())
 
-    X_train, nasa_train, y_train = build_sliding_windows(train_segments, WINDOW_SIZE)
-    X_test,  nasa_test,  y_test  = build_sliding_windows(test_segments,  WINDOW_SIZE)
+    calce_train = [s for i, s in enumerate(calce_remaining) if i not in calce_test_idx]
+    calce_test  = [s for i, s in enumerate(calce_remaining) if i in calce_test_idx]
+    new_train   = [s for i, s in enumerate(new_remaining)   if i not in new_test_idx]
+    new_test    = [s for i, s in enumerate(new_remaining)   if i in new_test_idx]
+
+    print(f"CALCE — train: {len(calce_train)}, test: {len(calce_test)}")
+    print(f"New   — train: {len(new_train)},   test: {len(new_test)}")
+
+    # --- per-domain feature normalization ---
+    calce_scaler, calce_lower, calce_upper = fit_domain_scaler(calce_train)
+    new_scaler,   new_lower,   new_upper   = fit_domain_scaler(new_train)
+
+    calce_train = scale_segments(calce_train, calce_scaler, calce_lower, calce_upper)
+    calce_test  = scale_segments(calce_test,  calce_scaler, calce_lower, calce_upper)
+    new_train   = scale_segments(new_train,   new_scaler,   new_lower,   new_upper)
+    new_test    = scale_segments(new_test,    new_scaler,   new_lower,   new_upper)
+
+    train_segments = calce_train + new_train
+    test_segments  = calce_test  + new_test
+
+    X_train, flags_train, y_train = build_sliding_windows(train_segments, WINDOW_SIZE)
+    X_test,  flags_test,  y_test  = build_sliding_windows(test_segments,  WINDOW_SIZE)
     print(f"Train windows: {X_train.shape}, Test windows: {X_test.shape}")
 
     train_loader = DataLoader(
-        BatteryWindowDataset(X_train, nasa_train, y_train),
+        BatteryWindowDataset(X_train, flags_train, y_train),
         batch_size=BATCH_SIZE, shuffle=True,  num_workers=0,
     )
     test_loader = DataLoader(
-        BatteryWindowDataset(X_test, nasa_test, y_test),
+        BatteryWindowDataset(X_test, flags_test, y_test),
         batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
     )
 
-    # --- model, loss, optimizer ---
+    # --- model ---
     model     = RULConvNet(num_features=len(FEATURE_COLS)).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {total_params:,}")
-
-    # --- training loop (skip if checkpoint exists) ---
-    import os
-    train_losses, val_losses = [], []
+    # --- train or load checkpoint ---
     if os.path.exists(CKPT_PATH):
         model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
         print(f"Loaded checkpoint from {CKPT_PATH}, skipping training.")
@@ -277,37 +281,32 @@ def main():
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
             val_loss, _, _, _ = evaluate(model, test_loader, criterion, device)
             scheduler.step()
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
             if epoch % 10 == 0 or epoch == 1:
-                print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train_loss={train_loss:.2f}  val_loss={val_loss:.2f}")
+                print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  train={train_loss:.2f}  val={val_loss:.2f}")
         torch.save(model.state_dict(), CKPT_PATH)
         print(f"Checkpoint saved to {CKPT_PATH}")
 
-    # --- final evaluation ---
-    _, cnn_preds, cnn_labels, cnn_is_nasa = evaluate(model, test_loader, criterion, device)
-    print(f"\nCNN  MAE:  {mean_absolute_error(cnn_labels, cnn_preds):.4f}")
-    print(f"CNN  RMSE: {np.sqrt(mean_squared_error(cnn_labels, cnn_preds)):.4f}")
-    print(f"CNN  R^2:  {r2_score(cnn_labels, cnn_preds):.4f}")
+    # --- evaluation ---
+    _, preds, labels, flags = evaluate(model, test_loader, criterion, device)
+    print(f"\nCNN  MAE:  {mean_absolute_error(labels, preds):.4f}")
+    print(f"CNN  RMSE: {np.sqrt(mean_squared_error(labels, preds)):.4f}")
+    print(f"CNN  R²:   {r2_score(labels, preds):.4f}")
 
-    # --- plot: predicted vs true, color-coded by dataset source ---
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    calce_mask = cnn_is_nasa == 0
-    nasa_mask  = cnn_is_nasa == 1
-    ax.scatter(cnn_labels[calce_mask], cnn_preds[calce_mask],
-               alpha=0.3, s=10, color="steelblue", label="CALCE")
-    ax.scatter(cnn_labels[nasa_mask],  cnn_preds[nasa_mask],
-               alpha=0.3, s=10, color="darkorange", label="NASA")
-
-    min_val, max_val = cnn_labels.min(), cnn_labels.max()
-    ax.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="red")
+    # --- scatter plot color-coded by domain ---
+    _, ax = plt.subplots(figsize=(6, 6))
+    calce_mask = flags == 0
+    new_mask   = flags == 1
+    ax.scatter(labels[calce_mask], preds[calce_mask],
+               alpha=0.3, s=10, color="steelblue",  label="CALCE")
+    ax.scatter(labels[new_mask],   preds[new_mask],
+               alpha=0.3, s=10, color="darkorange", label="New Battery")
+    lo, hi = labels.min(), labels.max()
+    ax.plot([lo, hi], [lo, hi], "--", color="red")
     ax.set_xlabel("True RUL")
     ax.set_ylabel("Predicted RUL")
     ax.set_title("Predicted vs True RUL (CNN)")
     ax.legend()
     ax.grid(True)
-
     plt.tight_layout()
     plt.savefig("cnn_pred_vs_true.png", dpi=150)
     plt.show()
