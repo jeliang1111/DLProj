@@ -23,9 +23,12 @@ FEATURE_COLS = [
     "Charging time (s)",
 ]
 
-CKPT_CNN = "checkpoints/checkpoint_cnn_rul.pt"
-CKPT_XGB = "checkpoints/checkpoint_xgboost_cross_standard.joblib"
-CKPT_TFT = "checkpoints/tft_nasa_weight_2p0_checkpoint.pt"
+CKPT_CNN         = "checkpoints/checkpoint_cnn_rul.pt"
+CKPT_XGB         = "checkpoints/checkpoint_xgboost_cross_standard.joblib"
+CKPT_TFT         = "checkpoints/tft_nasa_weight_2p0_checkpoint.pt"
+CKPT_TL_BASELINE = "checkpoints/ckpt_fewshot_baseline.pt"
+CKPT_TL_TRANSFER = "checkpoints/ckpt_fewshot_transfer.pt"
+TL_DATASET_PATH  = "best_demo_battery_features.csv"
 
 # Demo batteries are the ones excluded from all training/val/test splits in tft.ipynb
 # (segment_ids 1 and 40, picked with seed 42). Using these ensures fair evaluation.
@@ -34,7 +37,6 @@ DATASETS = {
     "NASA": ("NASA_TFT_SCALED.csv", 1),
 }
 
-WINDOW_SIZE = 10  # cycles passed to each model
 
 # ── Scaling constants ─────────────────────────────────────────────────────────
 # combined_scaled_battery_data.csv stats (used by CNN/TFT — display unscaling)
@@ -198,6 +200,60 @@ class TFTHybrid(nn.Module):
         s = self.static_branch(is_nasa.view(-1, 1))             # (B, 8)
         return self.regression_head(torch.cat([h, s], dim=1))   # (B, 1)
 
+# ── Transfer Learning model definitions ───────────────────────────────────────
+# ConvBlock with .block submodule (matches ckpt_fewshot_*.pt state dict keys)
+
+class TL_ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, k, padding=k // 2),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+        )
+    def forward(self, x):
+        return self.block(x)
+
+class TL_ConvEncoder(nn.Module):
+    def __init__(self, n_features=7):
+        super().__init__()
+        self.net = nn.Sequential(
+            TL_ConvBlock(n_features, 64),
+            TL_ConvBlock(64, 128),
+            nn.MaxPool1d(2),
+            TL_ConvBlock(128, 128),
+            TL_ConvBlock(128, 64),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, x):
+        return self.pool(self.net(x)).squeeze(-1)  # (B, 64)
+
+class TL_BaselineCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder   = TL_ConvEncoder(7)
+        self.regressor = nn.Sequential(
+            nn.Linear(64, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.regressor(self.encoder(x))  # (B, 1)
+
+class TL_TransferRULNet(nn.Module):
+    def __init__(self, encoder, fc_mu, latent_dim=32):
+        super().__init__()
+        self.encoder   = encoder
+        self.fc_mu     = fc_mu
+        self.regressor = nn.Sequential(
+            nn.Linear(latent_dim, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        h = self.encoder(x)   # (B, 64)
+        z = self.fc_mu(h)     # (B, latent_dim)
+        return self.regressor(z)  # (B, 1)
+
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -219,21 +275,32 @@ def load_tft():
     model.eval()
     return model
 
-# Option 2 — pytorch_forecasting loader (use with demo_tft_transformer_balanced.ckpt):
-# @st.cache_resource
-# def load_tft():
-#     from pytorch_forecasting import TemporalFusionTransformer
-#     import warnings
-#     with warnings.catch_warnings():
-#         warnings.simplefilter("ignore")
-#         model = TemporalFusionTransformer.load_from_checkpoint(CKPT_TFT, map_location="cpu")
-#     model.eval()
-#     return model
-
 @st.cache_data
 def load_dataset(name):
     path, _ = DATASETS[name]
     return pd.read_csv(path)
+
+@st.cache_resource
+def load_tl_baseline():
+    model = TL_BaselineCNN()
+    ckpt  = torch.load(CKPT_TL_BASELINE, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt)
+    model.eval()
+    return model
+
+@st.cache_resource
+def load_tl_transfer():
+    encoder = TL_ConvEncoder(7)
+    fc_mu   = nn.Linear(64, 32)
+    model   = TL_TransferRULNet(encoder, fc_mu, latent_dim=32)
+    ckpt    = torch.load(CKPT_TL_TRANSFER, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt)
+    model.eval()
+    return model
+
+@st.cache_data
+def load_tl_dataset():
+    return pd.read_csv(TL_DATASET_PATH)
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
 
@@ -260,144 +327,608 @@ def predict_tft(model, window_np, is_nasa_val):
     with torch.no_grad():
         return max(0.0, model(x, isn).item())
 
-# Option 2 — pytorch_forecasting TFT inference (use with demo_tft_transformer_balanced.ckpt):
-# def predict_tft(model, window_df, is_nasa_val):
-#     from pytorch_forecasting import TimeSeriesDataSet
-#     TFT_RENAME = {"Discharge Time (s)":"discharge_time","Decrement 3.6-3.4V (s)":"decrement_36_34",
-#                   "Max. Voltage Dischar. (V)":"max_voltage_discharge","Min. Voltage Charg. (V)":"min_voltage_charge",
-#                   "Time at 4.15V (s)":"time_at_415","Time constant current (s)":"time_constant_current","Charging time (s)":"charging_time"}
-#     df = window_df[FEATURE_COLS+["RUL"]].copy().rename(columns={**TFT_RENAME,"RUL":"target"})
-#     df["battery_id"]="demo"; df["time_idx"]=list(range(len(df))); df["Is_NASA"]=float(is_nasa_val); df["target"]=df["target"].astype(float)
-#     try:
-#         dataset = TimeSeriesDataSet(df,time_idx="time_idx",target="target",group_ids=["battery_id"],
-#             min_encoder_length=1,max_encoder_length=len(df),min_prediction_length=1,max_prediction_length=1,
-#             static_reals=["Is_NASA"],time_varying_known_reals=["time_idx"],
-#             time_varying_unknown_reals=list(TFT_RENAME.values()),add_relative_time_idx=True,add_encoder_length=True,predict_mode=True)
-#         dl = dataset.to_dataloader(batch_size=1,shuffle=False,num_workers=0)
-#         return max(0.0, model.predict(dl,return_index=False).squeeze().item())
-#     except Exception as e:
-#         return None, str(e)
+def tl_inverse_rul(raw):
+    """Invert MinMax RUL scaling: raw ∈ [0,1] → cycles. rul_min=1, rul_max=1055."""
+    return float(raw) * 1054 + 1
+
+def predict_tl_baseline(model, window_np):
+    """window_np: (W, 7) MinMax-scaled."""
+    x = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
+    with torch.no_grad():
+        return max(0.0, tl_inverse_rul(model(x).item()))
+
+def predict_tl_transfer(model, window_np):
+    """window_np: (W, 7) MinMax-scaled."""
+    x = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
+    with torch.no_grad():
+        return max(0.0, tl_inverse_rul(model(x).item()))
+
+# ── Batch inference helpers (used by RUL Trajectory tab) ──────────────────────
+
+def predict_cnn_batch(model, windows_np, is_nasa_val):
+    """windows_np: (N, W, 7) → predictions (N,)"""
+    x   = torch.tensor(windows_np, dtype=torch.float32).permute(0, 2, 1)  # (N, 7, W)
+    isn = torch.full((len(windows_np), 1), is_nasa_val, dtype=torch.float32)
+    with torch.no_grad():
+        return np.clip(model(x, isn).squeeze(-1).numpy(), 0, None)
+
+def predict_tft_batch(model, windows_np, is_nasa_val):
+    """windows_np: (N, W, 7) → predictions (N,)"""
+    x   = torch.tensor(windows_np, dtype=torch.float32).permute(0, 2, 1)  # (N, 7, W)
+    isn = torch.full((len(windows_np), 1), is_nasa_val, dtype=torch.float32)
+    with torch.no_grad():
+        return np.clip(model(x, isn).squeeze(-1).numpy(), 0, None)
+
+def predict_xgb_batch(bundle, last_rows_np, is_nasa_val, dataset_name):
+    """last_rows_np: (N, 7) in combined_scaled space → predictions (N,)"""
+    model    = bundle["model"] if isinstance(bundle, dict) else bundle
+    xgb_rows = np.vstack([rescale_for_xgb(r, dataset_name) for r in last_rows_np]).astype(np.float32)
+    if model.n_features_in_ == 8:
+        xgb_rows = np.hstack([xgb_rows, np.full((len(xgb_rows), 1), is_nasa_val, dtype=np.float32)])
+    return np.clip(model.predict(xgb_rows), 0, None)
+
+def get_tft_attention(model, window_np, is_nasa_val):
+    """Returns (W, W) averaged self-attention weight matrix for one window."""
+    x   = torch.tensor(window_np, dtype=torch.float32).T.unsqueeze(0)  # (1, 7, W)
+    isn = torch.tensor([[is_nasa_val]], dtype=torch.float32)
+    with torch.no_grad():
+        for blk in model.conv_feature_extractor:
+            x = blk(x)
+        x = x.transpose(1, 2)
+        tf = model.temporal_fusion
+        x_grn  = tf.input_grn(x)
+        lstm_out, _ = tf.lstm(x_grn)
+        x_lstm = tf.post_lstm_gate_norm(lstm_out, x_grn)
+        _, attn_w = tf.attention(x_lstm, x_lstm, x_lstm, need_weights=True)
+    return attn_w[0].numpy()  # (W, W)
 
 # ── Page setup ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Battery RUL Prediction", layout="wide")
-st.title("Battery RUL Prediction")
 
-# Check all checkpoints
-missing = [n for n, p in [("CNN", CKPT_CNN), ("XGBoost", CKPT_XGB), ("TFT", CKPT_TFT)]
-           if not os.path.exists(p)]
-if missing:
-    st.error(f"Missing checkpoints: {', '.join(missing)}")
-    st.stop()
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.header("Settings")
-
-dataset_name = st.sidebar.radio("Dataset", list(DATASETS.keys()))
-model_choice = st.sidebar.radio("Model", ["CNN", "XGBoost", "TFT", "All"])
-
+# ── Page selector (top of sidebar) ───────────────────────────────────────────
+page = st.sidebar.radio("Navigation", ["RUL Prediction", "Transfer Learning"],
+                        label_visibility="collapsed")
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"**Window size:** {WINDOW_SIZE} cycles")
-st.sidebar.markdown(f"**Predicts:** RUL at cycle {WINDOW_SIZE + 1}")
 
-# ── Session state for sampled window ──────────────────────────────────────────
-state_key = f"start_{dataset_name}"
-if state_key not in st.session_state:
-    st.session_state[state_key] = None
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — RUL Prediction (existing demo)
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "RUL Prediction":
 
-if st.sidebar.button("Random Sample", type="primary"):
-    df_full = load_dataset(dataset_name)
-    max_start = len(df_full) - WINDOW_SIZE - 1
-    if max_start < 0:
-        st.warning(f"Dataset too short (need > {WINDOW_SIZE + 1} rows).")
+    st.title("Battery RUL Prediction")
+
+    # Check all checkpoints
+    missing = [n for n, p in [("CNN", CKPT_CNN), ("XGBoost", CKPT_XGB), ("TFT", CKPT_TFT)]
+               if not os.path.exists(p)]
+    if missing:
+        st.error(f"Missing checkpoints: {', '.join(missing)}")
         st.stop()
-    st.session_state[state_key] = int(np.random.randint(0, max_start + 1))
 
-start = st.session_state[state_key]
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    st.sidebar.header("Settings")
 
-if start is None:
-    st.info("Select a dataset and model, then click **Random Sample**.")
-    st.stop()
+    dataset_name = st.sidebar.radio("Dataset", list(DATASETS.keys()))
+    model_choice = st.sidebar.radio("Model", ["CNN", "XGBoost", "TFT", "All"])
 
-# ── Extract window ────────────────────────────────────────────────────────────
-df_full   = load_dataset(dataset_name)
-_, is_nasa = DATASETS[dataset_name]
+    st.sidebar.markdown("---")
 
-window_df = df_full.iloc[start : start + WINDOW_SIZE].copy()
-true_rul  = float(df_full.iloc[start + WINDOW_SIZE]["RUL"])
-window_np = window_df[FEATURE_COLS].values.astype(np.float32)
+    # Load dataset early (cached) so slider bounds are known
+    df_full = load_dataset(dataset_name)
+    _, is_nasa = DATASETS[dataset_name]
 
-st.markdown(
-    f"**Dataset:** {dataset_name} &nbsp;|&nbsp; "
-    f"**Sampled rows:** {start}–{start + WINDOW_SIZE - 1} &nbsp;|&nbsp; "
-    f"**Predicting RUL at row:** {start + WINDOW_SIZE}"
-)
+    window_size = st.sidebar.slider("Window size (cycles)", min_value=5, max_value=50, value=10, step=1)
+    max_start = max(0, len(df_full) - window_size - 1)
 
-# ── Run inference ─────────────────────────────────────────────────────────────
-cnn_model = load_cnn()
-xgb_bundle = load_xgb()
-tft_model = load_tft()
+    # Clamp stored position if it now exceeds max_start (e.g. after window_size increase or dataset switch)
+    pos_key = f"pos_{dataset_name}"
+    if pos_key in st.session_state and st.session_state[pos_key] > max_start:
+        st.session_state[pos_key] = max_start
 
-run_cnn = model_choice in ("CNN", "All")
-run_xgb = model_choice in ("XGBoost", "All")
-run_tft = model_choice in ("TFT", "All")
+    if st.sidebar.button("Random Sample", type="primary"):
+        st.session_state[pos_key] = int(np.random.randint(0, max_start + 1))
 
-results = {}
-errors  = {}
+    start = st.sidebar.slider("Window start (cycle index)", 0, max(1, max_start), 0, key=pos_key)
 
-if run_cnn:
-    results["CNN"] = predict_cnn(cnn_model, window_np, is_nasa)
+    st.sidebar.markdown(f"**Predicts:** RUL at cycle index {start + window_size}")
 
-if run_xgb:
-    results["XGBoost"] = predict_xgb(xgb_bundle, window_np[-1], is_nasa, dataset_name)
+    # ── Shared colour map ─────────────────────────────────────────────────────
+    model_colors = {"CNN": "#4C9BE8", "XGBoost": "#2A9D8F", "TFT": "#F4A261"}
 
-if run_tft:
-    results["TFT"] = predict_tft(tft_model, window_np, is_nasa)
+    # ── Extract demo window (shared across tabs) ───────────────────────────────
+    window_df = df_full.iloc[start : start + window_size].copy()
+    true_rul  = float(df_full.iloc[start + window_size]["RUL"])
+    window_np = window_df[FEATURE_COLS].values.astype(np.float32)
 
-# ── Metric cards ──────────────────────────────────────────────────────────────
-model_colors = {"CNN": "#4C9BE8", "XGBoost": "#2A9D8F", "TFT": "#F4A261"}
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs(["Demo", "Manual Input", "RUL Trajectory", "TFT Attention"])
 
-num_cols = 1 + len(results) + len(errors)
-metric_cols = st.columns(num_cols)
-metric_cols[0].metric("True RUL", f"{true_rul:.1f} cycles")
+    # ══ TAB 1 — Demo ══════════════════════════════════════════════════════════
+    with tab1:
 
-for i, (name, pred) in enumerate(results.items(), 1):
-    err = pred - true_rul
-    metric_cols[i].metric(name, f"{pred:.1f} cycles", delta=f"{err:+.1f}", delta_color="inverse")
+        st.markdown(
+            f"**Dataset:** {dataset_name} &nbsp;|&nbsp; "
+            f"**Window:** cycles {start}–{start + window_size - 1} ({window_size} cycles) &nbsp;|&nbsp; "
+            f"**Predicting RUL at cycle:** {start + window_size}"
+        )
 
-for name, msg in errors.items():
-    st.warning(f"**{name} error:** {msg}")
+        # ── Run inference ─────────────────────────────────────────────────────
+        cnn_model  = load_cnn()
+        xgb_bundle = load_xgb()
+        tft_model  = load_tft()
 
-# ── Bar chart ─────────────────────────────────────────────────────────────────
-if results:
-    st.subheader("Predicted vs. True RUL")
+        run_cnn = model_choice in ("CNN", "All")
+        run_xgb = model_choice in ("XGBoost", "All")
+        run_tft = model_choice in ("TFT", "All")
 
-    names  = ["True RUL"] + list(results.keys())
-    values = [true_rul]   + list(results.values())
-    colors = ["#888888"]  + [model_colors[n] for n in results]
+        results = {}
+        errors  = {}
 
-    fig = go.Figure(go.Bar(
-        x=names, y=values,
-        marker_color=colors,
-        text=[f"{v:.1f}" for v in values],
-        textposition="outside",
-        width=0.45,
-    ))
-    fig.add_hline(y=true_rul, line_dash="dot", line_color="gray",
-                  annotation_text="True RUL", annotation_position="top right")
-    fig.update_layout(
-        yaxis_title="RUL (cycles)",
-        height=380,
-        margin=dict(t=40, b=40),
-        showlegend=False,
+        if run_cnn:
+            results["CNN"] = predict_cnn(cnn_model, window_np, is_nasa)
+        if run_xgb:
+            results["XGBoost"] = predict_xgb(xgb_bundle, window_np[-1], is_nasa, dataset_name)
+        if run_tft:
+            results["TFT"] = predict_tft(tft_model, window_np, is_nasa)
+
+        # ── Metric cards ──────────────────────────────────────────────────────
+        num_cols = 1 + len(results) + len(errors)
+        metric_cols = st.columns(num_cols)
+        metric_cols[0].metric("True RUL", f"{true_rul:.1f} cycles")
+        for i, (name, pred) in enumerate(results.items(), 1):
+            err = pred - true_rul
+            metric_cols[i].metric(name, f"{pred:.1f} cycles", delta=f"{err:+.1f}", delta_color="inverse")
+        for name, msg in errors.items():
+            st.warning(f"**{name} error:** {msg}")
+
+        # ── Bar chart ─────────────────────────────────────────────────────────
+        if results:
+            st.subheader("Predicted vs. True RUL")
+            names  = ["True RUL"] + list(results.keys())
+            values = [true_rul]   + list(results.values())
+            colors = ["#888888"]  + [model_colors[n] for n in results]
+            fig = go.Figure(go.Bar(
+                x=names, y=values, marker_color=colors,
+                text=[f"{v:.1f}" for v in values], textposition="outside", width=0.45,
+            ))
+            fig.add_hline(y=true_rul, line_dash="dot", line_color="gray",
+                          annotation_text="True RUL", annotation_position="top right")
+            fig.update_layout(yaxis_title="RUL (cycles)", height=380,
+                              margin=dict(t=40, b=40), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Input window table ────────────────────────────────────────────────
+        st.subheader("Input Window — Feature Values (Physical Units)")
+        display_df = unscale_window(window_df[FEATURE_COLS], dataset_name)
+        display_df.index = [f"Cycle {start + i}" for i in range(window_size)]
+        st.dataframe(display_df.style.background_gradient(axis=0, cmap="RdYlGn"),
+                     use_container_width=True)
+
+    # ══ TAB 2 — Manual Input ══════════════════════════════════════════════════
+    with tab2:
+        st.markdown(
+            "Paste rows copied from the dataset — one cycle per line, comma-separated, "
+            "**already scaled** (same scale as `combined_scaled_battery_data.csv`).  \n"
+            "Accepted formats per line: `feat1..7` (7 values), `feat1..7, RUL` (8), "
+            "or `cycle_idx, feat1..7, RUL` (9).  \n"
+            "CNN / TFT use all pasted rows as the window; XGBoost uses only the last row."
+        )
+
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            manual_dataset = st.radio("Dataset", list(DATASETS.keys()),
+                                      key="manual_dataset", horizontal=True)
+        with mcol2:
+            manual_model = st.radio("Model", ["CNN", "XGBoost", "TFT", "All"],
+                                    key="manual_model", horizontal=True)
+
+        _, manual_is_nasa = DATASETS[manual_dataset]
+
+        paste_text = st.text_area(
+            "Paste rows here:",
+            height=220,
+            placeholder=(
+                "Example (9-value format):\n"
+                "1.0,0.9171988257767602,2.364163027648995,-2.856,-3.099,1.978,1.836,1.000,1107\n"
+                "2.0,0.8912345678901234,2.201234567890123,-2.712,-2.987,1.856,1.723,0.987,1106"
+            ),
+            key="manual_paste",
+        )
+
+        if st.button("Run Prediction", type="primary", key="manual_run"):
+            lines = [l.strip() for l in paste_text.strip().splitlines() if l.strip()]
+            if not lines:
+                st.warning("No data pasted. Paste at least one row.")
+            else:
+                rows: list = []
+                rul_val = None
+                parse_error = None
+
+                for i, line in enumerate(lines):
+                    try:
+                        floats = [float(v.strip()) for v in line.split(",")]
+                    except ValueError:
+                        parse_error = f"Line {i + 1}: non-numeric value — `{line}`"
+                        break
+
+                    n = len(floats)
+                    if n == 9:          # cycle_idx, 7 features, RUL
+                        rows.append(floats[1:8])
+                        rul_val = floats[8]
+                    elif n == 8:        # 7 features, RUL
+                        rows.append(floats[:7])
+                        rul_val = floats[7]
+                    elif n == 7:        # 7 features only
+                        rows.append(floats[:7])
+                    else:
+                        parse_error = (f"Line {i + 1}: expected 7, 8, or 9 values, "
+                                       f"got {n} — `{line}`")
+                        break
+
+                if parse_error:
+                    st.error(parse_error)
+                else:
+                    manual_np = np.array(rows, dtype=np.float32)  # (N, 7)
+
+                    m_results: dict = {}
+                    m_errors:  dict = {}
+
+                    run_cnn_m = manual_model in ("CNN", "All")
+                    run_xgb_m = manual_model in ("XGBoost", "All")
+                    run_tft_m = manual_model in ("TFT", "All")
+
+                    if run_cnn_m:
+                        if manual_np.shape[0] < 2:
+                            m_errors["CNN"] = "Need ≥ 2 rows for CNN."
+                        else:
+                            m_results["CNN"] = predict_cnn(load_cnn(), manual_np, manual_is_nasa)
+
+                    if run_xgb_m:
+                        m_results["XGBoost"] = predict_xgb(
+                            load_xgb(), manual_np[-1], manual_is_nasa, manual_dataset)
+
+                    if run_tft_m:
+                        if manual_np.shape[0] < 2:
+                            m_errors["TFT"] = "Need ≥ 2 rows for TFT."
+                        else:
+                            m_results["TFT"] = predict_tft(load_tft(), manual_np, manual_is_nasa)
+
+                    # ── Metric cards ──────────────────────────────────────────
+                    n_mcols = (1 if rul_val is not None else 0) + len(m_results)
+                    if n_mcols > 0:
+                        m_cols = st.columns(n_mcols)
+                        col_idx = 0
+                        if rul_val is not None:
+                            m_cols[col_idx].metric("True RUL", f"{rul_val:.1f} cycles")
+                            col_idx += 1
+                        for name, pred in m_results.items():
+                            delta_str = f"{pred - rul_val:+.1f}" if rul_val is not None else None
+                            m_cols[col_idx].metric(name, f"{pred:.1f} cycles",
+                                                   delta=delta_str, delta_color="inverse")
+                            col_idx += 1
+
+                    for name, msg in m_errors.items():
+                        st.warning(f"**{name}:** {msg}")
+
+                    # ── Bar chart ─────────────────────────────────────────────
+                    if m_results:
+                        st.subheader("Predicted vs. True RUL")
+                        m_names  = (["True RUL"] if rul_val is not None else []) + list(m_results.keys())
+                        m_values = ([rul_val]    if rul_val is not None else []) + list(m_results.values())
+                        m_colors = (["#888888"]  if rul_val is not None else []) + [model_colors[n] for n in m_results]
+                        fig_m = go.Figure(go.Bar(
+                            x=m_names, y=m_values, marker_color=m_colors,
+                            text=[f"{v:.1f}" for v in m_values], textposition="outside", width=0.45,
+                        ))
+                        if rul_val is not None:
+                            fig_m.add_hline(y=rul_val, line_dash="dot", line_color="gray",
+                                            annotation_text="True RUL", annotation_position="top right")
+                        fig_m.update_layout(yaxis_title="RUL (cycles)", height=380,
+                                            margin=dict(t=40, b=40), showlegend=False)
+                        st.plotly_chart(fig_m, use_container_width=True)
+
+                    # ── Feature table ─────────────────────────────────────────
+                    st.subheader("Pasted Rows — Feature Values (Physical Units)")
+                    display_m = pd.DataFrame(manual_np, columns=FEATURE_COLS)
+                    display_m = unscale_window(display_m, manual_dataset)
+                    display_m.index = [f"Row {i}" for i in range(len(rows))]
+                    st.dataframe(display_m.style.background_gradient(axis=0, cmap="RdYlGn"),
+                                 use_container_width=True)
+
+    # ══ TAB 3 — RUL Trajectory ════════════════════════════════════════════════
+    with tab3:
+        st.markdown(
+            f"Slide the window across every cycle in **{dataset_name}** (window size = {window_size}). "
+            "Each point is the predicted RUL for the cycle immediately after that window."
+        )
+
+        traj_key = f"traj_{dataset_name}_{window_size}_{model_choice}"
+
+        if st.button("Generate Trajectory", type="primary", key="traj_btn"):
+            n_full   = len(df_full)
+            max_s    = n_full - window_size - 1
+            if max_s < 1:
+                st.warning("Dataset too short for a trajectory with this window size.")
+            else:
+                all_windows = np.stack(
+                    [df_full[FEATURE_COLS].values[s : s + window_size] for s in range(max_s + 1)]
+                ).astype(np.float32)  # (N, W, 7)
+                true_ruls_t = [float(df_full.iloc[s + window_size]["RUL"]) for s in range(max_s + 1)]
+                x_axis      = list(range(max_s + 1))
+
+                traj = {"x": x_axis, "true": true_ruls_t}
+                with st.spinner("Running inference across all windows…"):
+                    if model_choice in ("CNN", "All"):
+                        traj["CNN"] = predict_cnn_batch(load_cnn(), all_windows, is_nasa)
+                    if model_choice in ("XGBoost", "All"):
+                        traj["XGBoost"] = predict_xgb_batch(
+                            load_xgb(), all_windows[:, -1, :], is_nasa, dataset_name)
+                    if model_choice in ("TFT", "All"):
+                        traj["TFT"] = predict_tft_batch(load_tft(), all_windows, is_nasa)
+                st.session_state[traj_key] = traj
+
+        if traj_key in st.session_state:
+            traj = st.session_state[traj_key]
+            fig_t = go.Figure()
+            fig_t.add_trace(go.Scatter(
+                x=traj["x"], y=traj["true"], mode="lines", name="True RUL",
+                line=dict(color="#888888", width=2),
+            ))
+            for m_name, m_color in model_colors.items():
+                if m_name in traj:
+                    fig_t.add_trace(go.Scatter(
+                        x=traj["x"], y=list(traj[m_name]), mode="lines", name=m_name,
+                        line=dict(color=m_color, width=1.5),
+                    ))
+            fig_t.update_layout(
+                xaxis_title="Window start (cycle index)",
+                yaxis_title="RUL (cycles)",
+                height=460,
+                margin=dict(t=40, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
+        else:
+            st.info("Click **Generate Trajectory** to run sliding-window inference across the full battery.")
+
+    # ══ TAB 4 — TFT Attention ═════════════════════════════════════════════════
+    with tab4:
+        st.markdown(
+            "Self-attention weights computed by the TFT's attention layer for the **current demo window** "
+            "(set via the sidebar sliders). "
+            "Rows = query time step (attending *from*), Columns = key time step (attended *to*)."
+        )
+
+        cycle_labels = [f"Cycle {start + i}" for i in range(window_size)]
+        attn_w = get_tft_attention(load_tft(), window_np, is_nasa)  # (W, W)
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=attn_w,
+            x=cycle_labels,
+            y=cycle_labels,
+            colorscale="Blues",
+            text=[[f"{v:.3f}" for v in row] for row in attn_w],
+            texttemplate="%{text}",
+            showscale=True,
+        ))
+        fig_heat.update_layout(
+            title="Self-Attention Weight Matrix",
+            xaxis_title="Key (attended to)",
+            yaxis_title="Query (attending from)",
+            height=520,
+            margin=dict(t=60, b=40),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        st.subheader("Last-Step Attention — Prediction Focus")
+        st.caption("Attention weights from the final time step's perspective: which earlier cycles mattered most for the RUL prediction.")
+        fig_bar_a = go.Figure(go.Bar(
+            x=cycle_labels,
+            y=attn_w[-1],
+            marker_color=model_colors["TFT"],
+            text=[f"{v:.3f}" for v in attn_w[-1]],
+            textposition="outside",
+        ))
+        fig_bar_a.update_layout(
+            xaxis_title="Cycle",
+            yaxis_title="Attention weight",
+            height=320,
+            margin=dict(t=30, b=40),
+        )
+        st.plotly_chart(fig_bar_a, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — Transfer Learning
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Transfer Learning":
+
+    st.title("Transfer Learning — Battery RUL")
+    st.markdown(
+        "Comparing a **Baseline CNN** (trained from scratch on the target domain) "
+        "against **Transfer RULNet** (VAE-pretrained encoder frozen, only the regressor fine-tuned). "
+        "Both models use MinMax-scaled features from the held-out NASA demo battery."
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-# ── Input window table ────────────────────────────────────────────────────────
-st.subheader("Input Window — Feature Values (Physical Units)")
-display_df = unscale_window(window_df[FEATURE_COLS], dataset_name)
-display_df.index = [f"Cycle {start + i}" for i in range(WINDOW_SIZE)]
-st.dataframe(
-    display_df.style.background_gradient(axis=0, cmap="RdYlGn"),
-    use_container_width=True,
-)
+    # Check checkpoints and dataset
+    tl_missing = [(n, p) for n, p in [
+        ("Baseline CNN", CKPT_TL_BASELINE), ("Transfer RULNet", CKPT_TL_TRANSFER)
+    ] if not os.path.exists(p)]
+    if tl_missing:
+        st.error(f"Missing checkpoints: {', '.join(n for n, _ in tl_missing)}")
+        st.stop()
+    if not os.path.exists(TL_DATASET_PATH):
+        st.error(f"Dataset not found: {TL_DATASET_PATH}")
+        st.stop()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    st.sidebar.header("Settings")
+
+    tl_df = load_tl_dataset()
+    tl_window_size = st.sidebar.slider("Window size (cycles)", min_value=5, max_value=50,
+                                       value=10, step=1, key="tl_window_size")
+    tl_max_start = max(0, len(tl_df) - tl_window_size)
+
+    tl_pos_key = "tl_pos"
+    if tl_pos_key in st.session_state and st.session_state[tl_pos_key] > tl_max_start:
+        st.session_state[tl_pos_key] = tl_max_start
+
+    if st.sidebar.button("Random Sample", type="primary", key="tl_random"):
+        st.session_state[tl_pos_key] = int(np.random.randint(0, tl_max_start + 1))
+
+    tl_start = st.sidebar.slider("Window start (cycle index)", 0, max(1, tl_max_start), 0,
+                                  key=tl_pos_key)
+    st.sidebar.markdown(f"**Predicts:** RUL at cycle index {tl_start + tl_window_size - 1}")
+
+    tl_colors = {"Baseline CNN": "#E07B39", "Transfer RULNet": "#6C63FF"}
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tl_tab1, tl_tab2 = st.tabs(["Sample Window", "Manual Input"])
+
+    # ══ TL TAB 1 — Sample Window ══════════════════════════════════════════════
+    with tl_tab1:
+        tl_window_df = tl_df.iloc[tl_start : tl_start + tl_window_size].copy()
+        tl_true_rul  = float(tl_df.iloc[tl_start + tl_window_size - 1]["RUL"])
+        tl_window_np = tl_window_df[FEATURE_COLS].values.astype(np.float32)
+
+        tl_baseline_model  = load_tl_baseline()
+        tl_transfer_model  = load_tl_transfer()
+        tl_pred_base = predict_tl_baseline(tl_baseline_model, tl_window_np)
+        tl_pred_tran = predict_tl_transfer(tl_transfer_model, tl_window_np)
+
+        st.markdown(
+            f"**Battery:** NASA demo &nbsp;|&nbsp; "
+            f"**Window:** cycles {tl_start}–{tl_start + tl_window_size - 1} ({tl_window_size} cycles) &nbsp;|&nbsp; "
+            f"**True RUL at cycle {tl_start + tl_window_size - 1}:** {tl_true_rul:.0f}"
+        )
+
+        # Metric cards
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("True RUL", f"{tl_true_rul:.1f} cycles")
+        mc2.metric("Baseline CNN", f"{tl_pred_base:.1f} cycles",
+                   delta=f"{tl_pred_base - tl_true_rul:+.1f}", delta_color="inverse")
+        mc3.metric("Transfer RULNet", f"{tl_pred_tran:.1f} cycles",
+                   delta=f"{tl_pred_tran - tl_true_rul:+.1f}", delta_color="inverse")
+
+        # Bar chart
+        st.subheader("Predicted vs. True RUL")
+        tl_names  = ["True RUL", "Baseline CNN", "Transfer RULNet"]
+        tl_values = [tl_true_rul, tl_pred_base, tl_pred_tran]
+        tl_bar_colors = ["#888888", tl_colors["Baseline CNN"], tl_colors["Transfer RULNet"]]
+        fig_tl = go.Figure(go.Bar(
+            x=tl_names, y=tl_values, marker_color=tl_bar_colors,
+            text=[f"{v:.1f}" for v in tl_values], textposition="outside", width=0.45,
+        ))
+        fig_tl.add_hline(y=tl_true_rul, line_dash="dot", line_color="gray",
+                         annotation_text="True RUL", annotation_position="top right")
+        fig_tl.update_layout(yaxis_title="RUL (cycles)", height=380,
+                              margin=dict(t=40, b=40), showlegend=False)
+        st.plotly_chart(fig_tl, use_container_width=True)
+
+        # Feature table (MinMax-scaled, shown as-is)
+        st.subheader("Input Window — Feature Values (MinMax-Scaled, 0–1)")
+        tl_display_df = tl_window_df[FEATURE_COLS].copy()
+        tl_display_df.index = [f"Cycle {tl_start + i}" for i in range(tl_window_size)]
+        st.dataframe(tl_display_df.style.background_gradient(axis=0, cmap="RdYlGn"),
+                     use_container_width=True)
+
+    # ══ TL TAB 2 — Manual Input ═══════════════════════════════════════════════
+    with tl_tab2:
+        st.markdown(
+            "Paste **MinMax-scaled** feature rows (values in 0–1 range) — one cycle per line.  \n"
+            "Accepted formats per line: `feat1..7` (7 values), `feat1..7, RUL` (8), "
+            "or `cycle, feat1..7, RUL` (9).  \n"
+            "Both models use all pasted rows as the window (min 2 rows required)."
+        )
+
+        tl_paste = st.text_area(
+            "Paste rows here:",
+            height=220,
+            placeholder=(
+                "Example (7-value format):\n"
+                "1.0,1.0,0.0,0.0,1.0,1.0,1.0\n"
+                "1.0,1.0,1.0,0.0,1.0,1.0,1.0"
+            ),
+            key="tl_manual_paste",
+        )
+
+        if st.button("Run Prediction", type="primary", key="tl_manual_run"):
+            lines = [l.strip() for l in tl_paste.strip().splitlines() if l.strip()]
+            if not lines:
+                st.warning("No data pasted. Paste at least one row.")
+            else:
+                tl_rows: list = []
+                tl_rul_val = None
+                tl_parse_err = None
+
+                for i, line in enumerate(lines):
+                    try:
+                        floats = [float(v.strip()) for v in line.split(",")]
+                    except ValueError:
+                        tl_parse_err = f"Line {i + 1}: non-numeric value — `{line}`"
+                        break
+
+                    n = len(floats)
+                    if n == 9:
+                        tl_rows.append(floats[1:8])
+                        tl_rul_val = floats[8]
+                    elif n == 8:
+                        tl_rows.append(floats[:7])
+                        tl_rul_val = floats[7]
+                    elif n == 7:
+                        tl_rows.append(floats[:7])
+                    else:
+                        tl_parse_err = (f"Line {i + 1}: expected 7, 8, or 9 values, "
+                                        f"got {n} — `{line}`")
+                        break
+
+                if tl_parse_err:
+                    st.error(tl_parse_err)
+                elif len(tl_rows) < 2:
+                    st.warning("Need at least 2 rows for CNN-based models.")
+                else:
+                    tl_manual_np = np.array(tl_rows, dtype=np.float32)
+
+                    tl_m_base = predict_tl_baseline(load_tl_baseline(), tl_manual_np)
+                    tl_m_tran = predict_tl_transfer(load_tl_transfer(), tl_manual_np)
+
+                    # Metric cards
+                    n_tl_cols = (1 if tl_rul_val is not None else 0) + 2
+                    tl_m_cols = st.columns(n_tl_cols)
+                    col_i = 0
+                    if tl_rul_val is not None:
+                        tl_m_cols[col_i].metric("True RUL", f"{tl_rul_val:.1f} cycles")
+                        col_i += 1
+                    tl_m_cols[col_i].metric(
+                        "Baseline CNN", f"{tl_m_base:.1f} cycles",
+                        delta=f"{tl_m_base - tl_rul_val:+.1f}" if tl_rul_val is not None else None,
+                        delta_color="inverse",
+                    )
+                    tl_m_cols[col_i + 1].metric(
+                        "Transfer RULNet", f"{tl_m_tran:.1f} cycles",
+                        delta=f"{tl_m_tran - tl_rul_val:+.1f}" if tl_rul_val is not None else None,
+                        delta_color="inverse",
+                    )
+
+                    # Bar chart
+                    st.subheader("Predicted vs. True RUL")
+                    tl_m_names  = (["True RUL"] if tl_rul_val is not None else []) + ["Baseline CNN", "Transfer RULNet"]
+                    tl_m_values = ([tl_rul_val] if tl_rul_val is not None else []) + [tl_m_base, tl_m_tran]
+                    tl_m_clrs   = (["#888888"]  if tl_rul_val is not None else []) + [tl_colors["Baseline CNN"], tl_colors["Transfer RULNet"]]
+                    fig_tl_m = go.Figure(go.Bar(
+                        x=tl_m_names, y=tl_m_values, marker_color=tl_m_clrs,
+                        text=[f"{v:.1f}" for v in tl_m_values], textposition="outside", width=0.45,
+                    ))
+                    if tl_rul_val is not None:
+                        fig_tl_m.add_hline(y=tl_rul_val, line_dash="dot", line_color="gray",
+                                           annotation_text="True RUL", annotation_position="top right")
+                    fig_tl_m.update_layout(yaxis_title="RUL (cycles)", height=380,
+                                           margin=dict(t=40, b=40), showlegend=False)
+                    st.plotly_chart(fig_tl_m, use_container_width=True)
+
+                    # Feature table
+                    st.subheader("Pasted Rows — Feature Values (MinMax-Scaled, 0–1)")
+                    tl_m_display = pd.DataFrame(tl_manual_np, columns=FEATURE_COLS)
+                    tl_m_display.index = [f"Row {i}" for i in range(len(tl_rows))]
+                    st.dataframe(tl_m_display.style.background_gradient(axis=0, cmap="RdYlGn"),
+                                 use_container_width=True)
