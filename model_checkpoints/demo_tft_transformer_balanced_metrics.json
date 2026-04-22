@@ -1,31 +1,37 @@
 {
   "overall": {
-    "mae": 39.993927001953125,
-    "rmse": 90.61609870078274,
-    "r2": 0.9352531433105469
+    "mae": 26.825220108032227,
+    "rmse": 32.70738184490525,
+    "r2": 0.9915647506713867
   },
-  "best_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/demo_tft_transformer_balanced_nasa_weight_12p0-epoch=04-val_loss=45.5231-v1.ckpt",
+  "best_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/demo_tft_transformer_balanced_nasa_weight_12p0-epoch=04-val_balanced_source_norm_rmse=0.0739.ckpt",
   "stable_checkpoint_path": "model_checkpoints/demo_tft_transformer_balanced.ckpt",
-  "last_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/last-v1.ckpt",
-  "best_val_loss": 45.52312088012695,
+  "last_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/demo_tft_transformer_balanced/last-v2.ckpt",
+  "checkpoint_monitor": "val_balanced_source_norm_rmse",
+  "best_val_balanced_source_norm_rmse": 0.07385644316673279,
   "nasa_weight": 12.0,
+  "source_balanced_sampler": true,
+  "train_source_window_counts": {
+    "0.0": 12140,
+    "1.0": 1681
+  },
   "window": 10,
   "max_encoder_length": 10,
   "max_prediction_length": 1,
   "train_samples": 13821,
   "val_samples": 1794,
   "test_samples": 2899,
-  "log_dir": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/demo_tft_transformer_balanced_nasa_weight_12p0/version_1",
+  "log_dir": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/demo_tft_transformer_balanced_nasa_weight_12p0/version_2",
   "HNEI / CALCE": {
-    "mae": 26.380752563476562,
-    "rmse": 30.366147356446742,
-    "r2": 0.9913716316223145,
+    "mae": 27.916807174682617,
+    "rmse": 33.45130045234602,
+    "r2": 0.9895293116569519,
     "n": 2213
   },
   "NASA": {
-    "mae": 83.9093017578125,
-    "rmse": 178.11730246525744,
-    "r2": -7.904476165771484,
+    "mae": 23.303821563720703,
+    "rmse": 30.18282305579098,
+    "r2": 0.7443087100982666,
     "n": 686
   }
 }

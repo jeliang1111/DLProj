@@ -1,0 +1,103 @@
+{
+  "source_cell": "cell_005",
+  "source_rows": {
+    "train": 858,
+    "val": 184,
+    "test": 184
+  },
+  "target_train_cells": [
+    "cell_013",
+    "cell_025"
+  ],
+  "target_val_cells": [
+    "cell_010",
+    "cell_023",
+    "cell_041"
+  ],
+  "target_test_cells": [
+    "cell_001",
+    "cell_002",
+    "cell_003",
+    "cell_004",
+    "cell_006",
+    "cell_008",
+    "cell_009",
+    "cell_011",
+    "cell_014",
+    "cell_015",
+    "cell_024",
+    "cell_030",
+    "cell_032",
+    "cell_042"
+  ],
+  "feature_scaler_fit_cells": [
+    "cell_005"
+  ],
+  "source_target_scaler": {
+    "target_min": 369.0,
+    "target_max": 1226.0,
+    "target_range": 857.0,
+    "fit_battery_ids": [
+      "cell_005"
+    ]
+  },
+  "target_target_scaler": {
+    "target_min": 1.0,
+    "target_max": 1016.0,
+    "target_range": 1015.0,
+    "fit_battery_ids": [
+      "cell_013",
+      "cell_025"
+    ]
+  },
+  "latent_cols": [
+    "vae_latent_00",
+    "vae_latent_01",
+    "vae_latent_02",
+    "vae_latent_03",
+    "vae_latent_04",
+    "vae_latent_05",
+    "vae_latent_06",
+    "vae_latent_07"
+  ],
+  "tft_reals": [
+    "vae_latent_00",
+    "vae_latent_01",
+    "vae_latent_02",
+    "vae_latent_03",
+    "vae_latent_04",
+    "vae_latent_05",
+    "vae_latent_06",
+    "vae_latent_07"
+  ],
+  "vae_history": [
+    {
+      "epoch": 1,
+      "loss": 1.001091762578293,
+      "reconstruction_loss": 1.0010834918433413,
+      "kl_loss": 0.008266101139738705
+    }
+  ],
+  "args": {
+    "data_path": "features.csv",
+    "source_cell": null,
+    "target_train_cells": 2,
+    "target_val_cells": 3,
+    "window_size": 10,
+    "latent_dim": 8,
+    "vae_hidden_size": 64,
+    "vae_epochs": 1,
+    "source_epochs": 1,
+    "finetune_epochs": 1,
+    "batch_size": 64,
+    "vae_batch_size": 256,
+    "source_lr": 0.03,
+    "finetune_lr": 0.0001,
+    "finetune_mode": "head_only",
+    "use_raw_features": false,
+    "output_dir": "model_checkpoints/tft_vae_features_transfer",
+    "figure_path": "figures/tft_vae_features_before_after_finetune.png",
+    "predictions_path": "tft_vae_features_transfer_predictions.csv",
+    "metrics_path": "tft_vae_features_transfer_results.csv"
+  }
+}

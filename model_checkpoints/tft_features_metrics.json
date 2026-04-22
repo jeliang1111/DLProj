@@ -1,0 +1,45 @@
+{
+  "overall": {
+    "mae": 96.21299743652344,
+    "rmse": 123.71983533876045,
+    "r2": 0.8525457382202148
+  },
+  "best_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/tft_features/tft_features-epoch=00-val_loss=82.9373.ckpt",
+  "stable_checkpoint_path": "model_checkpoints/tft_features.ckpt",
+  "last_checkpoint_path": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/model_checkpoints/tft_features/last.ckpt",
+  "checkpoint_monitor": "val_loss",
+  "best_val_loss": 82.93728637695312,
+  "window": 10,
+  "max_encoder_length": 10,
+  "max_prediction_length": 1,
+  "train_samples": 11956,
+  "val_samples": 4087,
+  "test_samples": 4290,
+  "train_batteries": [
+    "cell_003",
+    "cell_004",
+    "cell_005",
+    "cell_008",
+    "cell_009",
+    "cell_011",
+    "cell_013",
+    "cell_014",
+    "cell_015",
+    "cell_023",
+    "cell_041",
+    "cell_042"
+  ],
+  "val_batteries": [
+    "cell_006",
+    "cell_010",
+    "cell_024",
+    "cell_030"
+  ],
+  "test_batteries": [
+    "cell_001",
+    "cell_002",
+    "cell_025",
+    "cell_032"
+  ],
+  "log_dir": "/Users/jihyun/Desktop/cmu/Deep Learning/Project/DLProj/lightning_logs/tft_features/version_1"
+}
